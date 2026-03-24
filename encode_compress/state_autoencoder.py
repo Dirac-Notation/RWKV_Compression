@@ -110,6 +110,75 @@ class AutoEncoderConfig:
     expected_wkv_shape: Tuple[int, int, int] = (32, 64, 64)
 
 
+class CayleyOrthogonal(nn.Module):
+    """
+    Orthogonal matrix via Cayley transform: R = (I - A)(I + A)^{-1}
+    with skew-symmetric A learned from unconstrained parameters P via A = (P - P^T) / 2.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        if dim < 1:
+            raise ValueError(f"dim must be >= 1, got {dim}")
+        self.dim = dim
+        self.p_raw = nn.Parameter(torch.zeros(dim, dim))
+
+    def skew_a(self) -> torch.Tensor:
+        p = self.p_raw.to(torch.float32)
+        return 0.5 * (p - p.mT)
+
+    def matrix_r(self) -> torch.Tensor:
+        d = self.dim
+        device = self.p_raw.device
+        identity = torch.eye(d, device=device, dtype=torch.float32)
+        a = self.skew_a()
+        i_plus = identity + a
+        i_minus = identity - a
+        # R = (I - A)(I + A)^{-1}
+        inv_factor = torch.linalg.solve(i_plus, identity)
+        r = i_minus @ inv_factor
+        return r
+
+
+class WKVSpatialCayleyRotation(nn.Module):
+    """
+    Per-layer, per-head spatial rotation on WKV (each head = one [H,W] matrix):
+    M'[h] = R1[h] @ M[h] @ R2[h]^T, inverse M[h] = R1[h]^T @ M'[h] @ R2[h] (R1[h], R2[h] orthogonal).
+    """
+
+    def __init__(self, num_heads: int, h: int, w: int):
+        super().__init__()
+        if num_heads < 1:
+            raise ValueError(f"num_heads must be >= 1, got {num_heads}")
+        self.num_heads = num_heads
+        self.rot_row = nn.ModuleList([CayleyOrthogonal(h) for _ in range(num_heads)])
+        self.rot_col = nn.ModuleList([CayleyOrthogonal(w) for _ in range(num_heads)])
+
+    def _stack_r1(self) -> torch.Tensor:
+        return torch.stack([m.matrix_r() for m in self.rot_row], dim=0)
+
+    def _stack_r2(self) -> torch.Tensor:
+        return torch.stack([m.matrix_r() for m in self.rot_col], dim=0)
+
+    def rotate_forward(self, wkv: torch.Tensor) -> torch.Tensor:
+        r1 = self._stack_r1().to(wkv.dtype)  # [C, H, H]
+        r2 = self._stack_r2().to(wkv.dtype)  # [C, W, W]
+        if wkv.ndim == 3:
+            return torch.einsum("cik,ckl,cjl->cij", r1, wkv, r2)
+        if wkv.ndim == 4:
+            return torch.einsum("cik,bckl,cjl->bcij", r1, wkv, r2)
+        raise ValueError(f"WKV tensor must be 3D or 4D, got shape={tuple(wkv.shape)}")
+
+    def rotate_inverse(self, wkv: torch.Tensor) -> torch.Tensor:
+        r1 = self._stack_r1().to(wkv.dtype)  # [C, H, H]
+        r2 = self._stack_r2().to(wkv.dtype)  # [C, W, W]
+        if wkv.ndim == 3:
+            return torch.einsum("cki,ckl,clj->cij", r1, wkv, r2)
+        if wkv.ndim == 4:
+            return torch.einsum("cki,bckl,clj->bcij", r1, wkv, r2)
+        raise ValueError(f"WKV tensor must be 3D or 4D, got shape={tuple(wkv.shape)}")
+
+
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size: int = 7):
         super().__init__()
@@ -136,42 +205,68 @@ class WKVConvAutoEncoder(nn.Module):
         super().__init__()
 
         # Encoder: downsample + dilated context + spatial attention
-        self.enc1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1)
-        self.enc1_dilated = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=2, dilation=2)
-        self.enc1_spatial = SpatialAttention(kernel_size=7)
+        self.encoder_blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=2, dilation=2),
+                    nn.GELU(),
+                    SpatialAttention(kernel_size=7),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=2, dilation=2),
+                    nn.GELU(),
+                    SpatialAttention(kernel_size=7),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=2, dilation=2),
+                    nn.GELU(),
+                    SpatialAttention(kernel_size=7),
+                ),
+            ]
+        )
 
-        self.enc2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
-        self.enc2_dilated = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=2, dilation=2)
-        self.enc2_spatial = SpatialAttention(kernel_size=7)
+        # Bottleneck keeps spatial size at 8x8 while expanding channels to 512.
+        self.bottleneck_block = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=2, dilation=2),
+            nn.GELU(),
+            SpatialAttention(kernel_size=7),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+        )
 
-        self.enc3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
-        self.enc3_dilated = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=2, dilation=2)
-        self.enc3_spatial = SpatialAttention(kernel_size=7)
-
-        # Deeper bottleneck block (keeps latent shape 512x4x4 with more non-linearity)
-        self.bottleneck_down = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)
-        self.bottleneck_dilated = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=2, dilation=2)
-        self.bottleneck_spatial = SpatialAttention(kernel_size=7)
-        self.bottleneck_refine1 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
-        self.bottleneck_refine2 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
-
-        # Decoder with PixelShuffle upsampling.
-        # Each stage: conv to (out_channels * 4) -> PixelShuffle(2) -> GELU -> SpatialAttention.
-        self.dec1_expand = nn.Conv2d(512, 128 * 4, kernel_size=3, stride=1, padding=1)
-        self.dec1_shuffle = nn.PixelShuffle(upscale_factor=2)
-        self.dec1_spatial = SpatialAttention(kernel_size=7)
-
-        self.dec2_expand = nn.Conv2d(128, 64 * 4, kernel_size=3, stride=1, padding=1)
-        self.dec2_shuffle = nn.PixelShuffle(upscale_factor=2)
-        self.dec2_spatial = SpatialAttention(kernel_size=7)
-
-        self.dec3_expand = nn.Conv2d(64, in_channels * 4, kernel_size=3, stride=1, padding=1)
-        self.dec3_shuffle = nn.PixelShuffle(upscale_factor=2)
-        self.dec3_spatial = SpatialAttention(kernel_size=7)
-
-        self.dec4_expand = nn.Conv2d(in_channels, in_channels * 4, kernel_size=3, stride=1, padding=1)
-        self.dec4_shuffle = nn.PixelShuffle(upscale_factor=2)
-        self.dec4_spatial = SpatialAttention(kernel_size=7)
+        # Decoder with PixelShuffle upsampling (8x8 -> 16x16 -> 32x32 -> 64x64).
+        self.decoder_blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(512, 128 * 4, kernel_size=3, stride=1, padding=1),
+                    nn.PixelShuffle(upscale_factor=2),
+                    nn.GELU(),
+                    SpatialAttention(kernel_size=7),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(128, 64 * 4, kernel_size=3, stride=1, padding=1),
+                    nn.PixelShuffle(upscale_factor=2),
+                    nn.GELU(),
+                    SpatialAttention(kernel_size=7),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(64, in_channels * 4, kernel_size=3, stride=1, padding=1),
+                    nn.PixelShuffle(upscale_factor=2),
+                    nn.GELU(),
+                    SpatialAttention(kernel_size=7),
+                ),
+            ]
+        )
         self.dec_out = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -186,31 +281,11 @@ class WKVConvAutoEncoder(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x, squeezed = self._to_4d(x)
-        x = x.to(self.enc1.weight.dtype)
-        z = self.enc1(x)
-        z = F.gelu(z)
-        z = self.enc1_dilated(z)
-        z = F.gelu(z)
-        z = self.enc1_spatial(z)
-        z = self.enc2(z)
-        z = F.gelu(z)
-        z = self.enc2_dilated(z)
-        z = F.gelu(z)
-        z = self.enc2_spatial(z)
-        z = self.enc3(z)
-        z = F.gelu(z)
-        z = self.enc3_dilated(z)
-        z = F.gelu(z)
-        z = self.enc3_spatial(z)
-        z = self.bottleneck_down(z)
-        z = F.gelu(z)
-        z = self.bottleneck_dilated(z)
-        z = F.gelu(z)
-        z = self.bottleneck_spatial(z)
-        z = self.bottleneck_refine1(z)
-        z = F.gelu(z)
-        z = self.bottleneck_refine2(z)
-        z = F.gelu(z)
+        x = x.to(self.encoder_blocks[0][0].weight.dtype)
+        z = x
+        for block in self.encoder_blocks:
+            z = block(z)
+        z = self.bottleneck_block(z)
         z = self.dropout(z)
         if squeezed:
             z = z.squeeze(0)
@@ -219,23 +294,10 @@ class WKVConvAutoEncoder(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         in_dtype = z.dtype
         z, squeezed = self._to_4d(z)
-        z = z.to(self.dec1_expand.weight.dtype)
-        x = self.dec1_expand(z)
-        x = self.dec1_shuffle(x)
-        x = F.gelu(x)
-        x = self.dec1_spatial(x)
-        x = self.dec2_expand(x)
-        x = self.dec2_shuffle(x)
-        x = F.gelu(x)
-        x = self.dec2_spatial(x)
-        x = self.dec3_expand(x)
-        x = self.dec3_shuffle(x)
-        x = F.gelu(x)
-        x = self.dec3_spatial(x)
-        x = self.dec4_expand(x)
-        x = self.dec4_shuffle(x)
-        x = F.gelu(x)
-        x = self.dec4_spatial(x)
+        z = z.to(self.decoder_blocks[0][0].weight.dtype)
+        x = z
+        for block in self.decoder_blocks:
+            x = block(x)
         x = self.dec_out(x)
         if squeezed:
             x = x.squeeze(0)
@@ -250,6 +312,15 @@ class StateStructureAutoEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.modules_by_layer = nn.ModuleDict()
+        self.rotations_by_layer = nn.ModuleDict()
+
+    def _ensure_rotation(self, layer_idx: int, num_heads: int, h: int, w: int) -> WKVSpatialCayleyRotation:
+        module_key = f"layer_{layer_idx}"
+        if module_key in self.rotations_by_layer:
+            return self.rotations_by_layer[module_key]
+        rot = WKVSpatialCayleyRotation(int(num_heads), int(h), int(w))
+        self.rotations_by_layer[module_key] = rot
+        return rot
 
     def _ensure_module(self, layer_idx: int, x: torch.Tensor) -> WKVConvAutoEncoder:
         module_key = f"layer_{layer_idx}"
@@ -263,6 +334,7 @@ class StateStructureAutoEncoder(nn.Module):
             raise ValueError(
                 f"Unexpected WKV shape at layer {layer_idx}: got {got}, expected {expected}."
             )
+        self._ensure_rotation(layer_idx, c, h, w)
         module = WKVConvAutoEncoder(in_channels=c, dropout=self.config.dropout)
         self.modules_by_layer[module_key] = module
         return module
@@ -290,7 +362,9 @@ class StateStructureAutoEncoder(nn.Module):
             if layer_idx is None:
                 return x
             module = self._ensure_module(layer_idx, x)
-            return module.encode(x)
+            rot = self.rotations_by_layer[f"layer_{layer_idx}"]
+            x_rot = rot.rotate_forward(x)
+            return module.encode(x_rot)
 
         return _apply_state(_encoder, state)
 
@@ -300,7 +374,9 @@ class StateStructureAutoEncoder(nn.Module):
             if layer_idx is None:
                 return z
             module = self._module_from_layer(layer_idx)
-            return module.decode(z)
+            rot = self.rotations_by_layer[f"layer_{layer_idx}"]
+            x_rot = module.decode(z)
+            return rot.rotate_inverse(x_rot)
 
         return _apply_state(_decoder, latent_state)
 
@@ -334,51 +410,20 @@ def mean_squared_error_wkv_only(pred: StateLike, target: StateLike) -> Tuple[tor
     return loss, float(loss.detach().cpu().item())
 
 
-def _as_batch_flat(x: torch.Tensor) -> torch.Tensor:
-    if x.ndim == 4:
-        return x.reshape(x.shape[0], -1)
-    if x.ndim == 3:
-        return x.reshape(1, -1)
-    raise ValueError(f"WKV tensor must be 3D or 4D, got shape={tuple(x.shape)}")
-
-
-def _as_batch_head_flat(x: torch.Tensor) -> torch.Tensor:
-    if x.ndim == 4:
-        b, c, h, w = x.shape
-        return x.reshape(b, c, h * w)
-    if x.ndim == 3:
-        c, h, w = x.shape
-        return x.reshape(1, c, h * w)
-    raise ValueError(f"WKV tensor must be 3D or 4D, got shape={tuple(x.shape)}")
-
-
-def peak_aware_wkv_loss(
-    pred: StateLike,
-    target: StateLike,
-    topk_weight: float = 0.1,
-    topk_ratio: float = 0.01,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    if not 0.0 <= topk_ratio <= 1.0:
-        raise ValueError(f"topk_ratio must be in [0,1], got {topk_ratio}")
-
-    mse_terms: List[torch.Tensor] = []
-    topk_terms: List[torch.Tensor] = []
+def rmse_plus_mae_wkv_only(pred: StateLike, target: StateLike) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Per-WKV-layer: RMSE = sqrt(MSE), MAE = mean |pred - target|.
+    Total loss = mean(RMSE over layers) + mean(MAE over layers).
+    """
+    rmse_terms: List[torch.Tensor] = []
+    mae_terms: List[torch.Tensor] = []
 
     def collect(lhs: StateLike, rhs: StateLike, path: Tuple[int, ...]) -> None:
         if torch.is_tensor(lhs):
-            if _path_to_wkv_layer(path) is None:
-                return
-            mse_terms.append(F.mse_loss(lhs, rhs))
-
-            lhs_head_flat = _as_batch_head_flat(lhs)
-            rhs_head_flat = _as_batch_head_flat(rhs)
-            if topk_ratio > 0:
-                numel_per_head = rhs_head_flat.shape[-1]
-                k = max(1, int(numel_per_head * topk_ratio))
-                topk_idx = torch.topk(rhs_head_flat, k=k, dim=-1).indices
-                pred_topk = torch.gather(lhs_head_flat, dim=-1, index=topk_idx)
-                target_topk = torch.gather(rhs_head_flat, dim=-1, index=topk_idx)
-                topk_terms.append(F.mse_loss(pred_topk, target_topk))
+            if _path_to_wkv_layer(path) is not None:
+                mse = F.mse_loss(lhs, rhs)
+                rmse_terms.append(torch.sqrt(mse + 1e-24))
+                mae_terms.append(F.l1_loss(lhs, rhs))
             return
         if isinstance(lhs, list):
             for i, (lv, rv) in enumerate(zip(lhs, rhs)):
@@ -391,15 +436,14 @@ def peak_aware_wkv_loss(
         raise TypeError(f"Unsupported state type: {type(lhs)}")
 
     collect(pred, target, ())
-    if not mse_terms:
+    if not rmse_terms:
         raise ValueError("No WKV tensor leaves found in state.")
 
-    mse_loss = torch.stack(mse_terms).mean()
-    topk_loss = torch.stack(topk_terms).mean() if topk_terms else torch.zeros_like(mse_loss)
-    total_loss = mse_loss + (topk_weight * topk_loss)
-
-    return total_loss, {
-        "total": float(total_loss.detach().cpu().item()),
-        "mse": float(mse_loss.detach().cpu().item()),
-        "topk_mse": float(topk_loss.detach().cpu().item()),
+    rmse_mean = torch.stack(rmse_terms).mean()
+    mae_mean = torch.stack(mae_terms).mean()
+    loss = rmse_mean + mae_mean
+    return loss, {
+        "total": float(loss.detach().cpu().item()),
+        "rmse": float(rmse_mean.detach().cpu().item()),
+        "mae": float(mae_mean.detach().cpu().item()),
     }

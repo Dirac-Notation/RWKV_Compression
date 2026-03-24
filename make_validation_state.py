@@ -23,7 +23,7 @@ class SquadSample:
 def parse_args():
     parser = argparse.ArgumentParser(description="Build prefilled validation states for RWKV experiments.")
     parser.add_argument("--model-path", type=str, default="BlinkDL/rwkv7-g1")
-    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-7.2b-20260301-ctx8192.pth")
+    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-1.5b-20260309-ctx8192.pth")
     parser.add_argument("--strategy", type=str, default="cuda fp16")
     parser.add_argument("--tokenizer", type=str, default="rwkv_vocab_v20230424")
     parser.add_argument("--split", type=str, default="validation")

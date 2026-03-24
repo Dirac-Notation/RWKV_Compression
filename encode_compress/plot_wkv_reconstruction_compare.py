@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument(
         "--input-data",
         type=str,
-        default="/data/.cache/data/val_index.json",
+        default="./encode_compress/data/val_index.json",
         help="Path to validation index json (e.g., val_index.json).",
     )
     parser.add_argument(
@@ -130,7 +130,7 @@ def plot_matrix_state_heads_0_to_3_3d(z_by_head: np.ndarray, title: str, out_pat
         if panel < len(selected):
             head_idx = selected[panel]
             zz = z_by_head[:, head_idx, :]
-            ax.plot_surface(xx, yy, zz, cmap="viridis", linewidth=0, antialiased=True)
+            ax.plot_surface(xx, yy, zz, cmap="Blues", linewidth=0, antialiased=True)
             ax.set_title(f"head={head_idx}", fontsize=10)
             ax.set_xlabel("data idx")
             ax.set_ylabel("channel")
@@ -141,6 +141,54 @@ def plot_matrix_state_heads_0_to_3_3d(z_by_head: np.ndarray, title: str, out_pat
 
     fig.suptitle(title, y=0.96)
     fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_matrix_state_heads_0_to_3_compare_3d(
+    z_orig_by_head: np.ndarray,
+    z_recon_by_head: np.ndarray,
+    title: str,
+    out_path: str,
+):
+    # z_*_by_head: [num_samples, num_heads, channels_per_head]
+    if z_orig_by_head.shape != z_recon_by_head.shape:
+        raise ValueError(
+            f"Shape mismatch: orig={z_orig_by_head.shape}, recon={z_recon_by_head.shape}"
+        )
+
+    sample_count, num_heads, channels_per_head = z_orig_by_head.shape
+    selected = [h for h in [0, 1, 2, 3] if h < num_heads]
+    if not selected:
+        return
+
+    rows = len(selected)
+    fig = plt.figure(figsize=(14, 4.2 * rows))
+    x = np.arange(sample_count, dtype=np.float32)
+    y = np.arange(channels_per_head, dtype=np.float32)
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+
+    for row, head_idx in enumerate(selected):
+        zz_orig = z_orig_by_head[:, head_idx, :]
+        ax_orig = fig.add_subplot(rows, 2, row * 2 + 1, projection="3d")
+        ax_orig.plot_surface(xx, yy, zz_orig, cmap="Blues", linewidth=0, antialiased=True)
+        ax_orig.set_title(f"head={head_idx} | original", fontsize=10)
+        ax_orig.set_xlabel("data idx")
+        ax_orig.set_ylabel("channel")
+        ax_orig.set_zlabel("|value|")
+        ax_orig.view_init(elev=30, azim=-55)
+
+        zz_recon = z_recon_by_head[:, head_idx, :]
+        ax_recon = fig.add_subplot(rows, 2, row * 2 + 2, projection="3d")
+        ax_recon.plot_surface(xx, yy, zz_recon, cmap="Blues", linewidth=0, antialiased=True)
+        ax_recon.set_title(f"head={head_idx} | reconstructed", fontsize=10)
+        ax_recon.set_xlabel("data idx")
+        ax_recon.set_ylabel("channel")
+        ax_recon.set_zlabel("|value|")
+        ax_recon.view_init(elev=30, azim=-55)
+
+    fig.suptitle(title, y=0.995)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.985])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -156,18 +204,91 @@ def plot_matrix_state_mean_by_head(z_mean_by_head: np.ndarray, title: str, out_p
         ax = fig.add_subplot(rows, cols, h + 1)
         img = ax.imshow(
             z_mean_by_head[h],
-            cmap="viridis",
+            cmap="Blues",
             aspect="auto",
             origin="lower",
         )
         ax.set_title(f"head={h}", fontsize=10)
         ax.set_xlabel("col")
         ax.set_ylabel("row")
+        for side in ("left", "right", "top", "bottom"):
+            ax.spines[side].set_visible(True)
         cbar = fig.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("|value|", fontsize=9)
 
     fig.subplots_adjust(top=0.90, wspace=0.45, hspace=0.45)
     fig.suptitle(title, y=0.97)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_matrix_state_mean_heads_0_to_3_compare_2d(
+    z_orig_mean_by_head: np.ndarray,
+    z_recon_mean_by_head: np.ndarray,
+    title: str,
+    out_path: str,
+):
+    # z_*_mean_by_head: [num_heads, N, N]
+    if z_orig_mean_by_head.shape != z_recon_mean_by_head.shape:
+        raise ValueError(
+            f"Shape mismatch: orig={z_orig_mean_by_head.shape}, recon={z_recon_mean_by_head.shape}"
+        )
+
+    num_heads, _, _ = z_orig_mean_by_head.shape
+    selected = [h for h in [0, 1, 2, 3] if h < num_heads]
+    if not selected:
+        return
+
+    rows = len(selected)
+    fig = plt.figure(figsize=(10, 3.8 * rows))
+
+    for row, head_idx in enumerate(selected):
+        # Share color scale within the same head (orig vs recon), not across different heads.
+        head_vmin = min(
+            float(z_orig_mean_by_head[head_idx].min()),
+            float(z_recon_mean_by_head[head_idx].min()),
+        )
+        head_vmax = max(
+            float(z_orig_mean_by_head[head_idx].max()),
+            float(z_recon_mean_by_head[head_idx].max()),
+        )
+
+        ax_orig = fig.add_subplot(rows, 2, row * 2 + 1)
+        img_orig = ax_orig.imshow(
+            z_orig_mean_by_head[head_idx],
+            cmap="Blues",
+            aspect="auto",
+            origin="lower",
+            vmin=head_vmin,
+            vmax=head_vmax,
+        )
+        ax_orig.set_title(f"head={head_idx} | original", fontsize=10)
+        ax_orig.set_xlabel("col")
+        ax_orig.set_ylabel("row")
+        for side in ("left", "right", "top", "bottom"):
+            ax_orig.spines[side].set_visible(True)
+        cbar_orig = fig.colorbar(img_orig, ax=ax_orig, fraction=0.046, pad=0.04)
+        cbar_orig.set_label("|value|", fontsize=9)
+
+        ax_recon = fig.add_subplot(rows, 2, row * 2 + 2)
+        img_recon = ax_recon.imshow(
+            z_recon_mean_by_head[head_idx],
+            cmap="Blues",
+            aspect="auto",
+            origin="lower",
+            vmin=head_vmin,
+            vmax=head_vmax,
+        )
+        ax_recon.set_title(f"head={head_idx} | reconstructed", fontsize=10)
+        ax_recon.set_xlabel("col")
+        ax_recon.set_ylabel("row")
+        for side in ("left", "right", "top", "bottom"):
+            ax_recon.spines[side].set_visible(True)
+        cbar_recon = fig.colorbar(img_recon, ax=ax_recon, fraction=0.046, pad=0.04)
+        cbar_recon.set_label("|value|", fontsize=9)
+
+    fig.suptitle(title, y=0.995)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.985])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -226,17 +347,13 @@ def main():
         z_recon = np.stack(per_layer_recon_flat[layer_idx], axis=0).astype(np.float32)
         z_diff = np.stack(per_layer_diff_flat[layer_idx], axis=0).astype(np.float32)
 
-        path_orig_3d = os.path.join(layer_dir, "wkv_original_heads_0_1_2_3_3d.png")
-        plot_matrix_state_heads_0_to_3_3d(
-            z_orig, f"Layer {layer_idx} | Original WKV", path_orig_3d
+        path_compare_3d = os.path.join(
+            layer_dir, "wkv_original_reconstructed_heads_0_1_2_3_3d.png"
         )
-        saved.append(path_orig_3d)
-
-        path_recon_3d = os.path.join(layer_dir, "wkv_reconstructed_heads_0_1_2_3_3d.png")
-        plot_matrix_state_heads_0_to_3_3d(
-            z_recon, f"Layer {layer_idx} | Reconstructed WKV", path_recon_3d
+        plot_matrix_state_heads_0_to_3_compare_3d(
+            z_orig, z_recon, f"Layer {layer_idx} | Original vs Reconstructed WKV", path_compare_3d
         )
-        saved.append(path_recon_3d)
+        saved.append(path_compare_3d)
 
         path_diff_3d = os.path.join(layer_dir, "wkv_abs_error_heads_0_1_2_3_3d.png")
         plot_matrix_state_heads_0_to_3_3d(
@@ -248,15 +365,16 @@ def main():
         recon_mean = np.stack(per_layer_recon_matrix[layer_idx], axis=0).mean(axis=0).astype(np.float32)
         diff_mean = np.abs(orig_mean - recon_mean).astype(np.float32)
 
-        path_orig_mean = os.path.join(layer_dir, "wkv_original_mean_by_head_2d.png")
-        plot_matrix_state_mean_by_head(orig_mean, f"Layer {layer_idx} | Original WKV Mean", path_orig_mean)
-        saved.append(path_orig_mean)
-
-        path_recon_mean = os.path.join(layer_dir, "wkv_reconstructed_mean_by_head_2d.png")
-        plot_matrix_state_mean_by_head(
-            recon_mean, f"Layer {layer_idx} | Reconstructed WKV Mean", path_recon_mean
+        path_compare_mean = os.path.join(
+            layer_dir, "wkv_original_reconstructed_mean_heads_0_1_2_3_2d.png"
         )
-        saved.append(path_recon_mean)
+        plot_matrix_state_mean_heads_0_to_3_compare_2d(
+            orig_mean,
+            recon_mean,
+            f"Layer {layer_idx} | Original vs Reconstructed WKV Mean",
+            path_compare_mean,
+        )
+        saved.append(path_compare_mean)
 
         path_diff_mean = os.path.join(layer_dir, "wkv_abs_error_mean_by_head_2d.png")
         plot_matrix_state_mean_by_head(

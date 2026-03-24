@@ -14,7 +14,7 @@ from rwkv_model import default_state_dir, load_validation_state_dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Observe RWKV states in 3D plots by layer.")
-    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-7.2b-20260301-ctx8192.pth")
+    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-1.5b-20260309-ctx8192.pth")
     parser.add_argument("--state-dir", type=str, default="")
     parser.add_argument("--num-samples", type=int, default=300)
     parser.add_argument("--output-dir", type=str, default="./squad_state_observe_3d_outputs")

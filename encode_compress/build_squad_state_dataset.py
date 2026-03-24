@@ -36,12 +36,12 @@ class SquadSample:
 def parse_args():
     parser = argparse.ArgumentParser(description="Build RWKV state dataset from SQuAD.")
     parser.add_argument("--model-path", type=str, default="BlinkDL/rwkv7-g1")
-    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-7.2b-20260301-ctx8192.pth")
+    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-1.5b-20260309-ctx8192.pth")
     parser.add_argument("--strategy", type=str, default="cuda fp16")
     parser.add_argument("--tokenizer", type=str, default="rwkv_vocab_v20230424")
     parser.add_argument("--train-limit", type=int, default=5000)
     parser.add_argument("--val-limit", type=int, default=300)
-    parser.add_argument("--output-dir", type=str, default="/data/.cache/data")
+    parser.add_argument("--output-dir", type=str, default="./encode_compress/data")
     return parser.parse_args()
 
 

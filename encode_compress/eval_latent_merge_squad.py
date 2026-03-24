@@ -31,10 +31,10 @@ from state_autoencoder import (
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate latent-level state merge on SQuAD.")
     parser.add_argument("--model-path", type=str, default="BlinkDL/rwkv7-g1")
-    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-7.2b-20260301-ctx8192.pth")
+    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-1.5b-20260309-ctx8192.pth")
     parser.add_argument("--strategy", type=str, default="cuda fp16")
     parser.add_argument("--tokenizer", type=str, default="rwkv_vocab_v20230424")
-    parser.add_argument("--state-index", type=str, default="/data/.cache/data/val_index.json")
+    parser.add_argument("--state-index", type=str, default="./encode_compress/data/val_index.json")
     parser.add_argument("--ae-checkpoint", type=str, default="./encode_compress/checkpoints/best.pt")
     parser.add_argument("--group-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
     parser.add_argument("--output-dir", type=str, default="./encode_compress/eval_outputs")
@@ -179,6 +179,16 @@ def append_mode_record(path: str, row: Dict[str, object]) -> None:
         f.flush()
 
 
+def _scale_state(state, factor: float):
+    if torch.is_tensor(state):
+        return state * factor
+    if isinstance(state, tuple):
+        return tuple(_scale_state(v, factor) for v in state)
+    if isinstance(state, list):
+        return [_scale_state(v, factor) for v in state]
+    raise TypeError(f"Unsupported state type: {type(state)}")
+
+
 def apply_plot_style():
     rcParams.update(
         {
@@ -219,7 +229,7 @@ def infer_group_size(records: List[Dict], file_path: str) -> int:
     name = os.path.basename(file_path)
     if name.startswith("no_merge_ae_"):
         return 1
-    match = re.search(r"merge_latent_sum_(\d+)_", name)
+    match = re.search(r"merge_latent_avg_(\d+)_", name)
     if match:
         return int(match.group(1))
     raise ValueError(f"Cannot infer group_size from: {file_path}")
@@ -251,7 +261,7 @@ def compute_accuracy_breakdown(all_ratios: List[float], group_size: int) -> Dict
 def mode_sort_key(mode_name: str):
     if mode_name == "No Merge (AE)":
         return (0, 0)
-    m = re.match(r"Merge Latent Sum (\d+)", mode_name)
+    m = re.match(r"Merge Latent Avg (\d+)", mode_name)
     if m:
         return (1, int(m.group(1)))
     return (2, mode_name)
@@ -261,7 +271,7 @@ def mode_label_from_file(file_path: str, group_size: int) -> str:
     name = os.path.basename(file_path)
     if name.startswith("no_merge_ae_"):
         return "No Merge (AE)"
-    return f"Merge Latent Sum {group_size}"
+    return f"Merge Latent Avg {group_size}"
 
 
 def build_mode_distributions(output_dir: str):
@@ -269,7 +279,7 @@ def build_mode_distributions(output_dir: str):
     for name in sorted(os.listdir(output_dir)):
         if not name.endswith("_qa_records.jsonl"):
             continue
-        if not (name.startswith("no_merge_ae_") or name.startswith("merge_latent_sum_")):
+        if not (name.startswith("no_merge_ae_") or name.startswith("merge_latent_avg_")):
             continue
         file_path = os.path.join(output_dir, name)
         records = load_records(file_path)
@@ -294,8 +304,8 @@ def plot_stacked_distribution(mode_data: List[Dict], output_path: str):
     if not mode_data:
         raise RuntimeError("No mode data to plot.")
     max_group_size = max(int(x["group_size"]) for x in mode_data)
-    labels = [x["mode"] for x in mode_data]
-    x_positions = list(range(len(mode_data)))
+    x_positions = [int(entry["group_size"]) for entry in mode_data]
+    x_tick_labels = [str(v) for v in x_positions]
     colors = ["#4C72B0", "#55A868", "#64B5CD", "#8172B3", "#CCB974", "#76B7B2", "#9C755F"]
 
     plt.figure()
@@ -318,14 +328,14 @@ def plot_stacked_distribution(mode_data: List[Dict], output_path: str):
         bottoms = [b + h for b, h in zip(bottoms, heights)]
 
     plt.ylabel("Ratio")
-    plt.xlabel("Evaluation Mode")
+    plt.xlabel("Number of Merged Group")
     plt.ylim(0, 1)
-    plt.xticks(x_positions, labels)
+    plt.xticks(x_positions, x_tick_labels)
     plt.grid(axis="y", linestyle="--", linewidth=1.0, alpha=0.5)
     for i, entry in enumerate(mode_data):
         text_y = min(0.98, entry["accuracy"] + 0.02)
         plt.text(
-            i,
+            x_positions[i],
             text_y,
             f"acc={entry['accuracy']:.3f}",
             ha="center",
@@ -443,7 +453,7 @@ def evaluate_merge_ae(
 ):
     correct = 0
     total = 0
-    pbar = tqdm(range(0, len(states), group_size), desc=f"Merge Latent Sum (N={group_size})")
+    pbar = tqdm(range(0, len(states), group_size), desc=f"Merge Latent Avg (N={group_size})")
     for start in pbar:
         group = states[start : start + group_size]
         if len(group) < group_size:
@@ -453,6 +463,7 @@ def evaluate_merge_ae(
         merged_latent = copy.deepcopy(latent_group[0])
         for latent in latent_group[1:]:
             merged_latent = add_states(merged_latent, latent)
+        merged_latent = _scale_state(merged_latent, 1.0 / group_size)
         merged_state = decode_latent_with_ae(ae, merged_latent, device)
 
         for row in group:
@@ -512,11 +523,11 @@ def main():
 
     for n in sorted(set(args.group_sizes)):
         if n > 1:
-            merge_path = init_mode_record_file(args.output_dir, f"merge_latent_sum_{n}")
+            merge_path = init_mode_record_file(args.output_dir, f"merge_latent_avg_{n}")
             merged = evaluate_merge_ae(
                 model, pipeline, gen_args, ae, state_records, n, max_new_tokens, merge_path, device
             )
-            results[f"Merge Latent Sum {n}"] = merged["accuracy"]
+            results[f"Merge Latent Avg {n}"] = merged["accuracy"]
 
     out_json = os.path.join(args.output_dir, "latent_merge_eval_results.json")
     with open(out_json, "w", encoding="utf-8") as f:

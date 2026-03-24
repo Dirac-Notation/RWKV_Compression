@@ -25,7 +25,7 @@ from rwkv_model import (
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate RWKV on SQuAD with state merge.")
     parser.add_argument("--model-path", type=str, default="BlinkDL/rwkv7-g1")
-    parser.add_argument("--model-filename", type=str, default="rwkv7-g1d-2.9b-20260131-ctx8192.pth")
+    parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-1.5b-20260309-ctx8192.pth")
     parser.add_argument("--strategy", type=str, default="cuda fp16")
     parser.add_argument("--tokenizer", type=str, default="rwkv_vocab_v20230424")
     parser.add_argument("--num-samples", type=int, default=300)
@@ -38,7 +38,7 @@ def merge_states(states: Sequence):
     merged = copy.deepcopy(states[0])
     for state in states[1:]:
         merged = _add_state(merged, state)
-    return merged
+    return _scale_state(merged, 1.0 / len(states))
 
 
 def _add_state(lhs, rhs):
@@ -49,6 +49,16 @@ def _add_state(lhs, rhs):
     if isinstance(lhs, list):
         return [_add_state(lv, rv) for lv, rv in zip(lhs, rhs)]
     raise TypeError(f"Unsupported state type: {type(lhs)}")
+
+
+def _scale_state(state, factor: float):
+    if torch.is_tensor(state):
+        return state * factor
+    if isinstance(state, tuple):
+        return tuple(_scale_state(v, factor) for v in state)
+    if isinstance(state, list):
+        return [_scale_state(v, factor) for v in state]
+    raise TypeError(f"Unsupported state type: {type(state)}")
 
 
 def init_mode_record_file(output_dir: str, mode_name: str) -> str:
@@ -176,8 +186,8 @@ def plot_stacked_distribution(mode_data: List[Dict], output_path: str):
     if not mode_data:
         raise RuntimeError("No mode data to plot.")
     max_group_size = max(int(x["group_size"]) for x in mode_data)
-    labels = [x["mode"] for x in mode_data]
-    x_positions = list(range(len(mode_data)))
+    x_positions = [int(entry["group_size"]) for entry in mode_data]
+    x_tick_labels = [str(v) for v in x_positions]
     colors = ["#4C72B0", "#55A868", "#64B5CD", "#8172B3", "#CCB974", "#76B7B2", "#9C755F"]
 
     plt.figure()
@@ -200,14 +210,14 @@ def plot_stacked_distribution(mode_data: List[Dict], output_path: str):
         bottoms = [b + h for b, h in zip(bottoms, heights)]
 
     plt.ylabel("Ratio")
-    plt.xlabel("Evaluation Mode")
+    plt.xlabel("Number of Merged Group")
     plt.ylim(0, 1)
-    plt.xticks(x_positions, labels)
+    plt.xticks(x_positions, x_tick_labels)
     plt.grid(axis="y", linestyle="--", linewidth=1.0, alpha=0.5)
     for i, entry in enumerate(mode_data):
         text_y = min(0.98, entry["accuracy"] + 0.02)
         plt.text(
-            i,
+            x_positions[i],
             text_y,
             f"acc={entry['accuracy']:.3f}",
             ha="center",
