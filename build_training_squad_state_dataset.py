@@ -15,8 +15,6 @@ os.environ.setdefault("RWKV_CUDA_ON", "0")
 from rwkv.model import RWKV
 from rwkv.utils import PIPELINE
 
-from state_autoencoder import move_state_to_cpu
-
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. "
     "Answer the question only using the provided context. "
@@ -24,6 +22,16 @@ DEFAULT_SYSTEM_PROMPT = (
     "then provide the final answer after </think>."
 )
 DEFAULT_RANDOM_SEED = 42
+
+
+def move_state_to_cpu(state):
+    if isinstance(state, list):
+        return [move_state_to_cpu(x) for x in state]
+    if isinstance(state, tuple):
+        return tuple(move_state_to_cpu(x) for x in state)
+    if torch.is_tensor(state):
+        return state.detach().cpu()
+    return state
 
 
 @dataclass
@@ -41,7 +49,7 @@ def parse_args():
     parser.add_argument("--tokenizer", type=str, default="rwkv_vocab_v20230424")
     parser.add_argument("--train-limit", type=int, default=5000)
     parser.add_argument("--val-limit", type=int, default=300)
-    parser.add_argument("--output-dir", type=str, default="./encode_compress/data")
+    parser.add_argument("--output-dir", type=str, default="./data")
     return parser.parse_args()
 
 

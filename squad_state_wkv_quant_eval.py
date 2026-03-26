@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections import OrderedDict
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import torch
@@ -24,7 +24,7 @@ from rwkv_model import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate RWKV with linear-quantized WKV state (plain vs outlier scaling)."
+        description="Evaluate RWKV with linear-quantized WKV state: per-matrix vs channel-wise (dataset-calibrated min/max per channel)."
     )
     parser.add_argument("--model-path", type=str, default="BlinkDL/rwkv7-g1")
     parser.add_argument("--model-filename", type=str, default="rwkv7-g1e-1.5b-20260309-ctx8192.pth")
@@ -68,6 +68,35 @@ def _linear_quant_dequant_flat(x_flat: torch.Tensor, bits: int) -> torch.Tensor:
     return q * scale + x_min
 
 
+def _flat_outlier_work(
+    flat: torch.Tensor, outlier_frac: Optional[float]
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Return work flat tensor; optionally downscale top-|x| outliers (same logic as linear_quant_dequant_matrix)."""
+    n = flat.numel()
+    if n == 0:
+        return flat, None, None
+    if outlier_frac is None or outlier_frac <= 0.0 or n <= 1:
+        return flat, None, None
+    k = max(1, int(n * outlier_frac))
+    k = min(k, n - 1)
+    abs_flat = flat.abs()
+    _, top_idx = torch.topk(abs_flat, k, largest=True)
+    mask_flat = torch.zeros(n, dtype=torch.bool, device=flat.device)
+    mask_flat[top_idx] = True
+    inlier_idx = ~mask_flat
+    inlier_vals = flat[inlier_idx]
+    outlier_vals = flat[mask_flat]
+    t = inlier_vals.abs().max()
+    o = outlier_vals.abs().max()
+    eps = 1e-12
+    if t > eps and o > t:
+        scale_s = o / t
+        work = flat.clone()
+        work[mask_flat] = flat[mask_flat] / scale_s
+        return work, mask_flat, scale_s
+    return flat, None, None
+
+
 def linear_quant_dequant_matrix(
     matrix: torch.Tensor, bits: int, outlier_frac: Optional[float]
 ) -> Tuple[torch.Tensor, float]:
@@ -85,32 +114,7 @@ def linear_quant_dequant_matrix(
     if n == 0:
         return matrix.clone(), float(bits) / float(orig_bits)
 
-    mask_flat: Optional[torch.Tensor] = None
-    scale_s: Optional[torch.Tensor] = None
-
-    if outlier_frac is not None and outlier_frac > 0.0 and n > 1:
-        k = max(1, int(n * outlier_frac))
-        k = min(k, n - 1)  # keep at least one inlier for scaling
-        abs_flat = flat.abs()
-        _, top_idx = torch.topk(abs_flat, k, largest=True)
-        mask_flat = torch.zeros(n, dtype=torch.bool, device=flat.device)
-        mask_flat[top_idx] = True
-        inlier_idx = ~mask_flat
-        inlier_vals = flat[inlier_idx]
-        outlier_vals = flat[mask_flat]
-        t = inlier_vals.abs().max()
-        o = outlier_vals.abs().max()
-        eps = 1e-12
-        if t > eps and o > t:
-            scale_s = o / t
-            work = flat.clone()
-            work[mask_flat] = flat[mask_flat] / scale_s
-        else:
-            work = flat
-            mask_flat = None
-            scale_s = None
-    else:
-        work = flat
+    work, mask_flat, scale_s = _flat_outlier_work(flat, outlier_frac)
 
     recon_flat = _linear_quant_dequant_flat(work, bits)
     if mask_flat is not None and scale_s is not None:
@@ -120,6 +124,111 @@ def linear_quant_dequant_matrix(
     recon = recon_flat.view_as(x).to(dtype=orig_dtype)
     compression = float(bits) / float(orig_bits)
     return recon, compression
+
+
+def _linear_quant_dequant_channelwise_2d(x: torch.Tensor, bits: int, ch_min: torch.Tensor, ch_max: torch.Tensor) -> torch.Tensor:
+    """Asymmetric linear quant per row (channel). ch_min/ch_max: shape [H] for x [H, W]."""
+    q_levels = (1 << bits) - 1
+    if q_levels <= 0:
+        return x
+    span = (ch_max - ch_min).clamp_min(1e-12)
+    scale = span / float(q_levels)
+    q = torch.round((x - ch_min.unsqueeze(-1)) / scale.unsqueeze(-1)).clamp(0, float(q_levels))
+    return q * scale.unsqueeze(-1) + ch_min.unsqueeze(-1)
+
+
+def linear_quant_dequant_matrix_channelwise(
+    matrix: torch.Tensor,
+    bits: int,
+    outlier_frac: Optional[float],
+    ch_min: torch.Tensor,
+    ch_max: torch.Tensor,
+) -> Tuple[torch.Tensor, float]:
+    """Per-channel (row-wise) quant using fixed ch_min/ch_max from calibration; optional outlier pre-scaling."""
+    orig_dtype = matrix.dtype
+    orig_bits = _dtype_bits(matrix)
+    x = matrix.float()
+    flat = x.flatten()
+    n = flat.numel()
+    if n == 0:
+        return matrix.clone(), float(bits) / float(orig_bits)
+
+    work_flat, mask_flat, scale_s = _flat_outlier_work(flat, outlier_frac)
+    work_2d = work_flat.view_as(x)
+    recon_2d = _linear_quant_dequant_channelwise_2d(work_2d, bits, ch_min, ch_max)
+    recon_flat = recon_2d.flatten()
+    if mask_flat is not None and scale_s is not None:
+        recon_flat = recon_flat.clone()
+        recon_flat[mask_flat] = recon_flat[mask_flat] * scale_s
+
+    recon = recon_flat.view_as(x).to(dtype=orig_dtype)
+    compression = float(bits) / float(orig_bits)
+    return recon, compression
+
+
+def build_wkv_channel_calibration(
+    dataset,
+    outlier_frac: Optional[float],
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Per layer: (ch_min, ch_max) with shape [num_heads, H] where H is channel dim (dim 0 of each head matrix).
+    Min/max are taken over all samples and all positions along the last dim for each channel.
+    """
+    state0 = dataset[0]["state"]
+    if not isinstance(state0, list) or len(state0) % 3 != 0:
+        raise RuntimeError("Unexpected state format: expected list length n_layer*3.")
+
+    layer_mins: List[torch.Tensor] = []
+    layer_maxs: List[torch.Tensor] = []
+    for i in range(0, len(state0), 3):
+        wkv0 = state0[i + 1]
+        if not torch.is_tensor(wkv0) or wkv0.ndim != 3:
+            layer_mins.append(torch.empty(0))
+            layer_maxs.append(torch.empty(0))
+            continue
+        nh, h_ch, _ = wkv0.shape
+        dev = wkv0.device
+        dt = torch.float32
+        layer_mins.append(torch.full((nh, h_ch), float("inf"), device=dev, dtype=dt))
+        layer_maxs.append(torch.full((nh, h_ch), float("-inf"), device=dev, dtype=dt))
+
+    for idx in range(len(dataset)):
+        state = dataset[idx]["state"]
+        layer_idx = 0
+        for i in range(0, len(state), 3):
+            wkv = state[i + 1]
+            if not torch.is_tensor(wkv) or wkv.ndim != 3:
+                layer_idx += 1
+                continue
+            if layer_mins[layer_idx].numel() == 0:
+                layer_idx += 1
+                continue
+            x = wkv.float()
+            num_heads = x.shape[0]
+            for h in range(num_heads):
+                flat = x[h].flatten()
+                work_flat, _, _ = _flat_outlier_work(flat, outlier_frac)
+                m2 = work_flat.view_as(x[h])
+                row_min = m2.min(dim=-1).values
+                row_max = m2.max(dim=-1).values
+                layer_mins[layer_idx][h] = torch.minimum(layer_mins[layer_idx][h], row_min)
+                layer_maxs[layer_idx][h] = torch.maximum(layer_maxs[layer_idx][h], row_max)
+            layer_idx += 1
+
+    for li in range(len(layer_mins)):
+        if layer_mins[li].numel() == 0:
+            continue
+        layer_mins[li] = torch.where(
+            torch.isfinite(layer_mins[li]), layer_mins[li], torch.zeros_like(layer_mins[li])
+        )
+        layer_maxs[li] = torch.where(
+            torch.isfinite(layer_maxs[li]), layer_maxs[li], torch.zeros_like(layer_maxs[li])
+        )
+        same = layer_mins[li] >= layer_maxs[li]
+        if same.any():
+            layer_maxs[li] = torch.where(same, layer_mins[li] + 1e-12, layer_maxs[li])
+
+    return list(zip(layer_mins, layer_maxs))
 
 
 def apply_linear_quant_to_wkv_state(
@@ -145,6 +254,47 @@ def apply_linear_quant_to_wkv_state(
             ratio_sum += compression
             ratio_count += 1
         out[i + 1] = torch.stack(recon_heads, dim=0)
+    return out, ratio_sum, ratio_count
+
+
+def apply_channelwise_quant_to_wkv_state(
+    state,
+    bits: int,
+    outlier_frac: Optional[float],
+    calibration: List[Tuple[torch.Tensor, torch.Tensor]],
+):
+    if not isinstance(state, list) or len(state) % 3 != 0:
+        raise RuntimeError("Unexpected state format: expected list length n_layer*3.")
+
+    out = clone_state(state)
+    ratio_sum = 0.0
+    ratio_count = 0
+    layer_idx = 0
+    for i in range(0, len(out), 3):
+        wkv = out[i + 1]
+        if not torch.is_tensor(wkv) or wkv.ndim != 3:
+            layer_idx += 1
+            continue
+        if layer_idx >= len(calibration):
+            layer_idx += 1
+            continue
+        ch_min_all, ch_max_all = calibration[layer_idx]
+        if ch_min_all.numel() == 0:
+            layer_idx += 1
+            continue
+        num_heads = wkv.shape[0]
+        recon_heads = []
+        for h in range(num_heads):
+            ch_min = ch_min_all[h].to(device=wkv.device, dtype=torch.float32)
+            ch_max = ch_max_all[h].to(device=wkv.device, dtype=torch.float32)
+            recon, compression = linear_quant_dequant_matrix_channelwise(
+                wkv[h], bits, outlier_frac, ch_min, ch_max
+            )
+            recon_heads.append(recon)
+            ratio_sum += compression
+            ratio_count += 1
+        out[i + 1] = torch.stack(recon_heads, dim=0)
+        layer_idx += 1
     return out, ratio_sum, ratio_count
 
 
@@ -203,7 +353,7 @@ def plot_quant_results(summary: OrderedDict, output_path: str):
     plt.ylim(0, min(1.0, max(accs + [0.1]) + 0.08))
     plt.ylabel("Accuracy")
     plt.xlabel("Quantization setting")
-    plt.title("RWKV WKV-State Linear Quantization", pad=12)
+    plt.title("RWKV WKV-State Quantization (per-matrix vs channel-wise calib.)", pad=12)
     plt.xticks(x, labels, rotation=15, ha="right")
     plt.grid(axis="y", linestyle="--", linewidth=1.0, alpha=0.45)
     plt.tight_layout()
@@ -219,6 +369,7 @@ def evaluate_mode(
     outlier_frac: Optional[float],
     max_new_tokens: int,
     record_path: str,
+    channel_calibration: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
 ):
     correct = 0
     ratio_sum = 0.0
@@ -227,7 +378,12 @@ def evaluate_mode(
     progress = tqdm(range(len(dataset)), desc=desc)
     for idx in progress:
         row = dataset[idx]
-        q_state, rs, rc = apply_linear_quant_to_wkv_state(row["state"], bits, outlier_frac)
+        if channel_calibration is not None:
+            q_state, rs, rc = apply_channelwise_quant_to_wkv_state(
+                row["state"], bits, outlier_frac, channel_calibration
+            )
+        else:
+            q_state, rs, rc = apply_linear_quant_to_wkv_state(row["state"], bits, outlier_frac)
         ratio_sum += rs
         ratio_count += rc
         sample_mean_compression = (rs / rc) if rc > 0 else 0.0
@@ -246,6 +402,7 @@ def evaluate_mode(
                 "bits": int(bits),
                 "outlier_frac": outlier_frac,
                 "mean_compression_ratio": sample_mean_compression,
+                "channelwise": channel_calibration is not None,
             },
         )
         running_acc = (correct / (idx + 1)) * 100.0
@@ -275,28 +432,73 @@ def main():
     results: OrderedDict[str, dict] = OrderedDict()
     of = float(args.outlier_frac)
 
+    calib_plain = build_wkv_channel_calibration(dataset, outlier_frac=None)
+
     for bits in args.bits:
         bits = int(bits)
-        for use_outlier in (False, True):
-            mode_key = f"{bits}bit_{'outlier_scale' if use_outlier else 'plain'}"
-            record_path = init_mode_record_file(output_dir, mode_key)
-            frac = of if use_outlier else None
-            result = evaluate_mode(
-                mode_key=mode_key,
-                rwkv=rwkv,
-                dataset=dataset,
-                bits=bits,
-                outlier_frac=frac,
-                max_new_tokens=max_new_tokens,
-                record_path=record_path,
-            )
-            results[mode_key] = {
-                "bits": bits,
-                "outlier_scaled": bool(use_outlier),
-                "outlier_frac": of if use_outlier else None,
-                "accuracy": result["accuracy"],
-                "mean_compression_ratio": result["mean_compression_ratio"],
-            }
+        # 1) naive per-matrix quantization
+        mode_key = f"{bits}bit_plain"
+        record_path = init_mode_record_file(output_dir, mode_key)
+        result = evaluate_mode(
+            mode_key=mode_key,
+            rwkv=rwkv,
+            dataset=dataset,
+            bits=bits,
+            outlier_frac=None,
+            max_new_tokens=max_new_tokens,
+            record_path=record_path,
+        )
+        results[mode_key] = {
+            "bits": bits,
+            "outlier_scaled": False,
+            "outlier_frac": None,
+            "channelwise": False,
+            "accuracy": result["accuracy"],
+            "mean_compression_ratio": result["mean_compression_ratio"],
+        }
+
+        # 2) scaling-based per-matrix quantization
+        mode_key = f"{bits}bit_outlier_scale"
+        record_path = init_mode_record_file(output_dir, mode_key)
+        result = evaluate_mode(
+            mode_key=mode_key,
+            rwkv=rwkv,
+            dataset=dataset,
+            bits=bits,
+            outlier_frac=of,
+            max_new_tokens=max_new_tokens,
+            record_path=record_path,
+        )
+        results[mode_key] = {
+            "bits": bits,
+            "outlier_scaled": True,
+            "outlier_frac": of,
+            "channelwise": False,
+            "accuracy": result["accuracy"],
+            "mean_compression_ratio": result["mean_compression_ratio"],
+        }
+
+        # 3) channel-wise quantization with dataset-level calibration
+        mode_key = f"{bits}bit_channelwise"
+        record_path = init_mode_record_file(output_dir, mode_key)
+        result = evaluate_mode(
+            mode_key=mode_key,
+            rwkv=rwkv,
+            dataset=dataset,
+            bits=bits,
+            outlier_frac=None,
+            max_new_tokens=max_new_tokens,
+            record_path=record_path,
+            channel_calibration=calib_plain,
+        )
+        results[mode_key] = {
+            "bits": bits,
+            "outlier_scaled": False,
+            "outlier_frac": None,
+            "channelwise": True,
+            "accuracy": result["accuracy"],
+            "mean_compression_ratio": result["mean_compression_ratio"],
+        }
 
     result_json = os.path.join(output_dir, "squad_rwkv_wkv_quant_eval_results.json")
     with open(result_json, "w", encoding="utf-8") as f:
@@ -307,10 +509,11 @@ def main():
     print(f"Saved summary: {result_json}")
     print(f"Saved plot: {plot_path}")
     for name, row in results.items():
+        cw = row.get("channelwise", False)
         print(
             f"{name}: acc={row['accuracy']:.4f}, "
             f"mean_compression={row['mean_compression_ratio']:.4f}, "
-            f"bits={row['bits']}, outlier_scaled={row['outlier_scaled']}"
+            f"bits={row['bits']}, outlier_scaled={row['outlier_scaled']}, channelwise={cw}"
         )
 
 

@@ -1,5 +1,6 @@
 # Custom
 dataset/
+data/
 result/
 models/
 *.pt
