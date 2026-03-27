@@ -31,9 +31,9 @@ def parse_args():
     parser.add_argument("--train-index", type=str, default="./data/train_index.json")
     parser.add_argument("--val-index", type=str, default="./data/val_index.json")
     parser.add_argument("--output-dir", type=str, default="./wkv_rotatequant/checkpoints")
-    parser.add_argument("--bits", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--bits", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     return parser.parse_args()
@@ -68,14 +68,14 @@ def main():
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=8,
         collate_fn=collate_states,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=8,
         collate_fn=collate_states,
     )
 

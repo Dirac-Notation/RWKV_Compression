@@ -146,6 +146,10 @@ def summarize_state_shapes(state) -> Dict[str, object]:
     return summary
 
 
+def build_pair_text(samples: Sequence[SquadSample], left_idx: int, right_idx: int) -> str:
+    return f"{samples[left_idx].context} {samples[right_idx].context}".strip()
+
+
 def write_state_records(
     model,
     pipeline,
@@ -155,38 +159,70 @@ def write_state_records(
     output_dir: str,
 ):
     split_dir = os.path.join(output_dir, split_name)
-    os.makedirs(split_dir, exist_ok=True)
-    index_rows = []
+    one_state_dir = os.path.join(split_dir, "one_state")
+    two_state_dir = os.path.join(split_dir, "two_state")
+    os.makedirs(one_state_dir, exist_ok=True)
+    os.makedirs(two_state_dir, exist_ok=True)
+    text_rows = []
+    one_state_rows = []
+    two_state_rows = []
     first_state_summary = {}
 
-    for idx, sample in enumerate(tqdm(samples, desc=f"Build {split_name} states")):
+    for idx, sample in enumerate(tqdm(samples, desc=f"Build {split_name} one_state")):
         state = prefill_state_from_context(model, pipeline, system_prompt, sample.context)
-        row = {
-            "index": idx,
-            "context": sample.context,
-            "question": sample.question,
-            "answers": sample.answers,
-            "state": state,
-        }
-        state_path = os.path.join(split_dir, f"{idx:08d}.pt")
-        torch.save(row, state_path)
+        one_path = os.path.join(one_state_dir, f"{idx}.pt")
+        torch.save({"index": idx, "state": state}, one_path)
         if idx == 0:
             first_state_summary = summarize_state_shapes(state)
-        index_rows.append(
+        text_rows.append(
             {
                 "index": idx,
-                "file": state_path,
+                "text": sample.context,
+                "question": sample.question,
+                "answers": sample.answers,
             }
         )
+        one_state_rows.append({"index": idx, "file": one_path})
 
-    index_path = os.path.join(output_dir, f"{split_name}_index.json")
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index_rows, f, ensure_ascii=False, indent=2)
+    for left_idx in tqdm(range(max(len(samples) - 1, 0)), desc=f"Build {split_name} two_state"):
+        right_idx = left_idx + 1
+        pair_text = build_pair_text(samples, left_idx, right_idx)
+        pair_state = prefill_state_from_context(model, pipeline, system_prompt, pair_text)
+        pair_name = f"{left_idx}_{right_idx}.pt"
+        pair_path = os.path.join(two_state_dir, pair_name)
+        torch.save(
+            {
+                "pair": [left_idx, right_idx],
+                "left_index": left_idx,
+                "right_index": right_idx,
+                "text": pair_text,
+                "state": pair_state,
+            },
+            pair_path,
+        )
+        two_state_rows.append({"pair": [left_idx, right_idx], "file": pair_path})
+
+    texts_path = os.path.join(split_dir, "texts.jsonl")
+    with open(texts_path, "w", encoding="utf-8") as f:
+        for row in text_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    one_index_path = os.path.join(split_dir, "one_state_index.json")
+    with open(one_index_path, "w", encoding="utf-8") as f:
+        json.dump(one_state_rows, f, ensure_ascii=False, indent=2)
+
+    two_index_path = os.path.join(split_dir, "two_state_index.json")
+    with open(two_index_path, "w", encoding="utf-8") as f:
+        json.dump(two_state_rows, f, ensure_ascii=False, indent=2)
 
     return {
-        "count": len(index_rows),
-        "index_file": index_path,
+        "count": len(one_state_rows),
         "split_dir": split_dir,
+        "texts_file": texts_path,
+        "one_state_dir": one_state_dir,
+        "two_state_dir": two_state_dir,
+        "one_state_index_file": one_index_path,
+        "two_state_index_file": two_index_path,
         "state_shape_summary": first_state_summary,
     }
 
@@ -233,14 +269,24 @@ def main():
         "state_shape_summary": train_info["state_shape_summary"],
         "train_split_dir": train_info["split_dir"],
         "val_split_dir": val_info["split_dir"],
-        "train_index_file": train_info["index_file"],
-        "val_index_file": val_info["index_file"],
+        "train_texts_file": train_info["texts_file"],
+        "val_texts_file": val_info["texts_file"],
+        "train_one_state_dir": train_info["one_state_dir"],
+        "val_one_state_dir": val_info["one_state_dir"],
+        "train_two_state_dir": train_info["two_state_dir"],
+        "val_two_state_dir": val_info["two_state_dir"],
+        "train_one_state_index_file": train_info["one_state_index_file"],
+        "val_one_state_index_file": val_info["one_state_index_file"],
+        "train_two_state_index_file": train_info["two_state_index_file"],
+        "val_two_state_index_file": val_info["two_state_index_file"],
     }
     with open(os.path.join(args.output_dir, "dataset_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"Saved train index: {train_info['index_file']} ({train_info['count']})")
-    print(f"Saved val index: {val_info['index_file']} ({val_info['count']})")
+    print(f"Saved train one_state: {train_info['one_state_dir']} ({train_info['count']})")
+    print(f"Saved train two_state: {train_info['two_state_dir']}")
+    print(f"Saved val one_state: {val_info['one_state_dir']} ({val_info['count']})")
+    print(f"Saved val two_state: {val_info['two_state_dir']}")
 
 
 if __name__ == "__main__":
