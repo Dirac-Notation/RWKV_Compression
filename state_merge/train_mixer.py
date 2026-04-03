@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from state_merge.mixer import DynamicStateMixer
+from state_merge.mixer import DynamicStateMixer, count_layers_heads_from_state
 
 
 def parse_args():
@@ -173,10 +173,29 @@ def main():
 
     if len(train_ds) == 0:
         raise ValueError("Empty training dataset.")
+    one_files = sorted(
+        os.path.join(train_one, name) for name in os.listdir(train_one) if name.endswith(".pt")
+    )
+    if not one_files:
+        raise ValueError(f"No one_state .pt files in {train_one}")
+    first_item = torch.load(one_files[0], map_location="cpu")
+    num_layers, heads, h_meta, w_meta = count_layers_heads_from_state(first_item["state"])
     h = int(train_ds[0]["x"].shape[-2])
     w = int(train_ds[0]["x"].shape[-1])
-    model = DynamicStateMixer(train_ds.num_groups, h, w)
-    print(f"[init] mixer group count: {train_ds.num_groups}")
+    if h_meta != h or w_meta != w:
+        raise ValueError(
+            f"Spatial size mismatch: state tree {(h_meta, w_meta)} vs dataset x {(h, w)}"
+        )
+    if train_ds.num_groups != num_layers * heads:
+        raise ValueError(
+            f"WKV unit count mismatch: dataset num_groups={train_ds.num_groups} "
+            f"vs num_layers*heads={num_layers * heads}"
+        )
+    model = DynamicStateMixer(num_layers, heads, h, w)
+    print(
+        f"[init] mixer layers={num_layers} heads_per_layer={heads} "
+        f"total_units={train_ds.num_groups}"
+    )
     model = model.to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))

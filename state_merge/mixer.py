@@ -11,37 +11,35 @@ def _is_wkv_path(path: List[int]) -> bool:
     return len(path) == 1 and (path[0] % 3 == 1)
 
 
-class DynamicStateMixer(nn.Module):
+class _LayerMixerBlock(nn.Module):
     """
-    Data-dependent mixer with dynamic gating.
-    Uses state A as baseline and injects state B through learned gates.
+    One layer: inputs are A_ell, B_ell, and previous layer merged AB_{ell-1} (same head layout).
+    Output is AB_ell (same shape as A_ell).
     """
 
-    def __init__(self, num_groups: int, height: int, width: int):
+    def __init__(self, heads_per_layer: int, height: int, width: int):
         super().__init__()
-        if num_groups < 1:
-            raise ValueError(f"num_groups must be >= 1, got {num_groups}")
-        if height < 1 or width < 1:
-            raise ValueError(f"height/width must be >= 1, got {(height, width)}")
-        self.num_groups = num_groups
+        if heads_per_layer < 1:
+            raise ValueError(f"heads_per_layer must be >= 1, got {heads_per_layer}")
+        self.heads_per_layer = heads_per_layer
         self.height = height
         self.width = width
-        hidden_dim = max(8, num_groups // 4)
+        hidden_dim = max(8, heads_per_layer // 3)
         self.context_mlp = nn.Sequential(
-            nn.Linear(num_groups * 2, hidden_dim),
+            nn.Linear(heads_per_layer * 3, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, num_groups * 2),
+            nn.Linear(hidden_dim, heads_per_layer * 2),
         )
-        self.spatial_conv = nn.Conv2d(num_groups * 2, num_groups * 2, kernel_size=1, bias=True)
+        self.spatial_conv = nn.Conv2d(heads_per_layer * 3, heads_per_layer * 2, kernel_size=1, bias=True)
         nn.init.normal_(self.spatial_conv.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.spatial_conv.bias)
 
     def forward(self, x: torch.Tensor):
         if x.dim() != 4:
-            raise ValueError(f"Expected 4D [B, 2*N, H, W], got {tuple(x.shape)}")
-        if x.size(1) != 2 * self.num_groups:
+            raise ValueError(f"Expected 4D [B, 3*H, h, w], got {tuple(x.shape)}")
+        if x.size(1) != 3 * self.heads_per_layer:
             raise ValueError(
-                f"Expected channel size 2*N={2 * self.num_groups}, got {x.size(1)}"
+                f"Expected channel size 3*H={3 * self.heads_per_layer}, got {x.size(1)}"
             )
         if x.size(2) != self.height or x.size(3) != self.width:
             raise ValueError(
@@ -49,20 +47,89 @@ class DynamicStateMixer(nn.Module):
             )
 
         bsz, _, h, w = x.shape
-        xg = x.view(bsz, self.num_groups, 2, h, w)
-        global_context = xg.mean(dim=(-2, -1)).reshape(bsz, self.num_groups * 2)
-        global_logits = self.context_mlp(global_context).view(bsz, self.num_groups, 2, 1, 1)
-        spatial_logits = self.spatial_conv(x).view(bsz, self.num_groups, 2, h, w)
+        xg = x.view(bsz, self.heads_per_layer, 3, h, w)
+        global_context = xg.mean(dim=(-2, -1)).reshape(bsz, self.heads_per_layer * 3)
+        global_logits = self.context_mlp(global_context).view(bsz, self.heads_per_layer, 2, 1, 1)
+        spatial_logits = self.spatial_conv(x).view(bsz, self.heads_per_layer, 2, h, w)
         logits = global_logits + spatial_logits
 
-        # Residual merge: state A + gate * (state B - state A)
-        # Gate is computed from relative preference between B and A.
         weight_b = torch.sigmoid(logits[:, :, 1] - logits[:, :, 0])
         weight_a = 1.0 - weight_b
         coeff = torch.stack([weight_a, weight_b], dim=2)
         xa = xg[:, :, 0]
         xb = xg[:, :, 1]
         mixed = xa + weight_b * (xb - xa)
+        return {
+            "logits": logits,
+            "coeff": coeff,
+            "weight_a": weight_a,
+            "weight_b": weight_b,
+            "mixed": mixed,
+        }
+
+
+class DynamicStateMixer(nn.Module):
+    """
+    Layer-wise sequential mixer: layer ell uses A_ell, B_ell, and AB_{ell-1}
+    (zeros for ell == 0). Each layer has its own parameters.
+    """
+
+    def __init__(self, num_layers: int, heads_per_layer: int, height: int, width: int):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+        if heads_per_layer < 1:
+            raise ValueError(f"heads_per_layer must be >= 1, got {heads_per_layer}")
+        if height < 1 or width < 1:
+            raise ValueError(f"height/width must be >= 1, got {(height, width)}")
+        self.num_layers = num_layers
+        self.heads_per_layer = heads_per_layer
+        self.height = height
+        self.width = width
+        self.num_groups = num_layers * heads_per_layer
+        self.layer_blocks = nn.ModuleList(
+            [_LayerMixerBlock(heads_per_layer, height, width) for _ in range(num_layers)]
+        )
+
+    def forward(self, x: torch.Tensor):
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D [B, 2*N, H, W], got {tuple(x.shape)}")
+        n_total = self.num_layers * self.heads_per_layer
+        if x.size(1) != 2 * n_total:
+            raise ValueError(f"Expected channel size 2*N={2 * n_total}, got {x.size(1)}")
+        if x.size(2) != self.height or x.size(3) != self.width:
+            raise ValueError(
+                f"Expected spatial size {(self.height, self.width)}, got {(x.size(2), x.size(3))}"
+            )
+
+        bsz, _, h, w = x.shape
+        xa = x[:, :n_total].view(bsz, self.num_layers, self.heads_per_layer, h, w)
+        xb = x[:, n_total:].view(bsz, self.num_layers, self.heads_per_layer, h, w)
+        prev_ab = torch.zeros(bsz, self.heads_per_layer, h, w, device=x.device, dtype=x.dtype)
+
+        logits_list: List[torch.Tensor] = []
+        coeff_list: List[torch.Tensor] = []
+        weight_a_list: List[torch.Tensor] = []
+        weight_b_list: List[torch.Tensor] = []
+        mixed_layers: List[torch.Tensor] = []
+
+        for ell in range(self.num_layers):
+            xa_l = xa[:, ell]
+            xb_l = xb[:, ell]
+            cat = torch.cat([xa_l, xb_l, prev_ab], dim=1)
+            out = self.layer_blocks[ell](cat)
+            prev_ab = out["mixed"]
+            logits_list.append(out["logits"])
+            coeff_list.append(out["coeff"])
+            weight_a_list.append(out["weight_a"])
+            weight_b_list.append(out["weight_b"])
+            mixed_layers.append(prev_ab.unsqueeze(1))
+
+        mixed = torch.cat(mixed_layers, dim=1).view(bsz, n_total, h, w)
+        logits = torch.stack(logits_list, dim=1)
+        coeff = torch.stack(coeff_list, dim=1)
+        weight_a = torch.stack(weight_a_list, dim=1)
+        weight_b = torch.stack(weight_b_list, dim=1)
         return {
             "logits": logits,
             "coeff": coeff,
@@ -86,25 +153,17 @@ def move_state_to_device(state: Any, device: torch.device | str):
     return state
 
 
-def _count_units_and_spatial(state: Any) -> tuple[int, int, int]:
-    n = 0
-    h_ref = 0
-    w_ref = 0
+def _count_layers_heads_spatial(state: Any) -> tuple[int, int, int, int]:
+    layer_specs: List[tuple[int, int, int]] = []
 
     def walk(x: Any, path: List[int]):
-        nonlocal n, h_ref, w_ref
         if torch.is_tensor(x):
             if _is_wkv_path(path):
                 if x.ndim < 2:
                     raise ValueError(f"WKV tensor must be >=2D, got shape={tuple(x.shape)} at path={path}")
-                n += int(math.prod(x.shape[:-2]))
+                heads = int(math.prod(x.shape[:-2]))
                 h, w = int(x.shape[-2]), int(x.shape[-1])
-                if h_ref == 0 and w_ref == 0:
-                    h_ref, w_ref = h, w
-                elif h_ref != h or w_ref != w:
-                    raise ValueError(
-                        f"Inconsistent WKV spatial size: {(h_ref, w_ref)} vs {(h, w)} at path={path}"
-                    )
+                layer_specs.append((heads, h, w))
             return
         if isinstance(x, (list, tuple)):
             for i, item in enumerate(x):
@@ -113,7 +172,20 @@ def _count_units_and_spatial(state: Any) -> tuple[int, int, int]:
         raise TypeError(f"Unsupported state type: {type(x)}")
 
     walk(state, [])
-    return n, h_ref, w_ref
+    if not layer_specs:
+        raise ValueError("State has no WKV tensor leaves.")
+    heads0, h0, w0 = layer_specs[0]
+    for i, (heads, h, w) in enumerate(layer_specs):
+        if heads != heads0 or h != h0 or w != w0:
+            raise ValueError(
+                f"Inconsistent WKV layout across layers: layer0={layer_specs[0]} vs layer{i}={(heads, h, w)}"
+            )
+    return len(layer_specs), heads0, h0, w0
+
+
+def count_layers_heads_from_state(state: Any) -> tuple[int, int, int, int]:
+    """Return (num_layers, heads_per_layer, height, width) from an RWKV state tree."""
+    return _count_layers_heads_spatial(state)
 
 
 class HeadwiseStateMixer(nn.Module):
@@ -130,6 +202,8 @@ class HeadwiseStateMixer(nn.Module):
         self.cosine_weight = cosine_weight
         self.rec_tol = rec_tol
         self._num_units = 0
+        self._num_layers = 0
+        self._heads_per_layer = 0
         self._mixer: DynamicStateMixer | None = None
         self._built = False
 
@@ -140,10 +214,13 @@ class HeadwiseStateMixer(nn.Module):
     def build_from_state(self, state: Any):
         if self._built:
             return
-        self._num_units, h, w = _count_units_and_spatial(state)
+        num_layers, heads, h, w = _count_layers_heads_spatial(state)
+        self._num_layers = num_layers
+        self._heads_per_layer = heads
+        self._num_units = num_layers * heads
         if self._num_units < 1:
             raise ValueError("State has no valid tensor leaves.")
-        self._mixer = DynamicStateMixer(self._num_units, h, w)
+        self._mixer = DynamicStateMixer(num_layers, heads, h, w)
         self._built = True
 
     def _tensor_loss(self, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
