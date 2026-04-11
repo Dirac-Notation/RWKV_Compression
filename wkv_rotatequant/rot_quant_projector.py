@@ -1,48 +1,21 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Union
+import os
+import sys
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-StateLike = Union[torch.Tensor, List["StateLike"], Tuple["StateLike", ...]]
-
-
-def _path_to_wkv_layer(path: Tuple[int, ...]) -> Union[int, None]:
-    if len(path) != 1:
-        return None
-    slot_idx = path[0]
-    if slot_idx % 3 != 1:
-        return None
-    return slot_idx // 3
-
-
-def _apply_state(fn, state: StateLike, path: Tuple[int, ...] = ()) -> StateLike:
-    if torch.is_tensor(state):
-        return fn(state, path)
-    if isinstance(state, list):
-        return [_apply_state(fn, x, path + (i,)) for i, x in enumerate(state)]
-    if isinstance(state, tuple):
-        return tuple(_apply_state(fn, x, path + (i,)) for i, x in enumerate(state))
-    raise TypeError(f"Unsupported state type: {type(state)}")
-
-
-def stack_states(states: List[StateLike]) -> StateLike:
-    if not states:
-        raise ValueError("stack_states requires at least one state.")
-    head = states[0]
-    if torch.is_tensor(head):
-        return torch.stack(states, dim=0)
-    if isinstance(head, list):
-        return [stack_states([s[i] for s in states]) for i in range(len(head))]
-    if isinstance(head, tuple):
-        return tuple(stack_states([s[i] for s in states]) for i in range(len(head)))
-    raise TypeError(f"Unsupported state type: {type(head)}")
-
-
-def move_state_to_device(state: StateLike, device: torch.device) -> StateLike:
-    return _apply_state(lambda x, _: x.to(device), state)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from state_utils import (  # noqa: F401  (re-exported for sibling modules)
+    StateLike,
+    _apply_state,
+    _path_to_wkv_layer,
+    move_state_to_device,
+    stack_states,
+)
 
 
 class STEQuantizer:

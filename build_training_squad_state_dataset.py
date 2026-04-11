@@ -15,6 +15,9 @@ os.environ.setdefault("RWKV_CUDA_ON", "0")
 from rwkv.model import RWKV
 from rwkv.utils import PIPELINE
 
+from rwkv_model import resolve_rwkv_model_path
+from state_utils import move_state_to_cpu
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. "
     "Answer the question only using the provided context. "
@@ -22,16 +25,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "then provide the final answer after </think>."
 )
 DEFAULT_RANDOM_SEED = 42
-
-
-def move_state_to_cpu(state):
-    if isinstance(state, list):
-        return [move_state_to_cpu(x) for x in state]
-    if isinstance(state, tuple):
-        return tuple(move_state_to_cpu(x) for x in state)
-    if torch.is_tensor(state):
-        return state.detach().cpu()
-    return state
 
 
 @dataclass
@@ -51,51 +44,6 @@ def parse_args():
     parser.add_argument("--val-limit", type=int, default=300)
     parser.add_argument("--output-dir", type=str, default="./data")
     return parser.parse_args()
-
-
-def resolve_rwkv_model_path(model_path: str, model_filename: str = "") -> str:
-    if os.path.isfile(model_path):
-        if model_path.endswith(".pth"):
-            return model_path[:-4]
-        return model_path
-    if os.path.isfile(model_path + ".pth"):
-        return model_path
-    if model_path.endswith(".pth"):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-    if "/" not in model_path:
-        raise FileNotFoundError(
-            f"Invalid model path '{model_path}'. "
-            "Use local .pth path or Hugging Face repo id like 'BlinkDL/rwkv7-g1'."
-        )
-    try:
-        from huggingface_hub import hf_hub_download, list_repo_files
-    except ImportError as e:
-        raise ImportError(
-            "huggingface_hub is required for auto download. "
-            "Install it with: pip install huggingface_hub"
-        ) from e
-    repo_files = list_repo_files(repo_id=model_path)
-    pth_files = [f for f in repo_files if f.endswith(".pth")]
-    if not pth_files:
-        raise FileNotFoundError(f"No .pth file found in Hugging Face repo: {model_path}")
-
-    target_file = model_filename or sorted(pth_files)[-1]
-    if target_file not in pth_files:
-        raise FileNotFoundError(
-            f"'{target_file}' not found in repo {model_path}. Available: {pth_files}"
-        )
-
-    model_dir = os.path.join(os.getcwd(), "models")
-    os.makedirs(model_dir, exist_ok=True)
-    local_path = hf_hub_download(
-        repo_id=model_path,
-        filename=target_file,
-        local_dir=model_dir,
-        local_dir_use_symlinks=False,
-    )
-    if not local_path.endswith(".pth"):
-        raise RuntimeError(f"Downloaded file is not a .pth model: {local_path}")
-    return local_path[:-4]
 
 
 def load_squad_samples(split: str, limit: int, seed: int) -> List[SquadSample]:
@@ -184,8 +132,8 @@ def write_state_records(
         )
         one_state_rows.append({"index": idx, "file": one_path})
 
-    for left_idx in tqdm(range(max(len(samples) - 1, 0)), desc=f"Build {split_name} two_state"):
-        right_idx = left_idx + 1
+    for left_idx in tqdm(range(len(samples)), desc=f"Build {split_name} two_state"):
+        right_idx = (left_idx + 1) % len(samples) if len(samples) > 0 else 0
         pair_text = build_pair_text(samples, left_idx, right_idx)
         pair_state = prefill_state_from_context(model, pipeline, system_prompt, pair_text)
         pair_name = f"{left_idx}_{right_idx}.pt"

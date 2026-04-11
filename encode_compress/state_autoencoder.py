@@ -1,107 +1,27 @@
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple, Union
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-StateLike = Union[torch.Tensor, List["StateLike"], Tuple["StateLike", ...]]
-
-
-def _path_to_wkv_layer(path: Tuple[int, ...]) -> Union[int, None]:
-    # RWKV7 state layout per layer:
-    # idx*3+0: time-mixing shift vector
-    # idx*3+1: matrix-valued WKV state
-    # idx*3+2: channel-mixing shift vector
-    if len(path) != 1:
-        return None
-    slot_idx = path[0]
-    if slot_idx % 3 != 1:
-        return None
-    return slot_idx // 3
-
-
-def _apply_state(fn, state: StateLike, path: Tuple[int, ...] = ()) -> StateLike:
-    if torch.is_tensor(state):
-        return fn(state, path)
-    if isinstance(state, list):
-        return [_apply_state(fn, x, path + (i,)) for i, x in enumerate(state)]
-    if isinstance(state, tuple):
-        return tuple(_apply_state(fn, x, path + (i,)) for i, x in enumerate(state))
-    raise TypeError(f"Unsupported state type: {type(state)}")
-
-
-def stack_states(states: Sequence[StateLike]) -> StateLike:
-    if not states:
-        raise ValueError("stack_states requires at least one state.")
-    head = states[0]
-    if torch.is_tensor(head):
-        return torch.stack(list(states), dim=0)
-    if isinstance(head, list):
-        return [stack_states([s[i] for s in states]) for i in range(len(head))]
-    if isinstance(head, tuple):
-        return tuple(stack_states([s[i] for s in states]) for i in range(len(head)))
-    raise TypeError(f"Unsupported state type: {type(head)}")
-
-
-def unstack_states(batched_state: StateLike) -> List[StateLike]:
-    if torch.is_tensor(batched_state):
-        return list(torch.unbind(batched_state, dim=0))
-    if isinstance(batched_state, list):
-        parts = [unstack_states(x) for x in batched_state]
-        return [[parts[i][j] for i in range(len(parts))] for j in range(len(parts[0]))]
-    if isinstance(batched_state, tuple):
-        parts = [unstack_states(x) for x in batched_state]
-        return [tuple(parts[i][j] for i in range(len(parts))) for j in range(len(parts[0]))]
-    raise TypeError(f"Unsupported state type: {type(batched_state)}")
-
-
-def move_state_to_device(state: StateLike, device: torch.device) -> StateLike:
-    return _apply_state(lambda x, _: x.to(device), state)
-
-
-def move_state_to_cpu(state: StateLike) -> StateLike:
-    return _apply_state(lambda x, _: x.detach().cpu(), state)
-
-
-def clone_state(state: StateLike) -> StateLike:
-    return _apply_state(lambda x, _: x.clone(), state)
-
-
-def add_states(lhs: StateLike, rhs: StateLike) -> StateLike:
-    if torch.is_tensor(lhs):
-        return lhs + rhs
-    if isinstance(lhs, list):
-        return [add_states(lv, rv) for lv, rv in zip(lhs, rhs)]
-    if isinstance(lhs, tuple):
-        return tuple(add_states(lv, rv) for lv, rv in zip(lhs, rhs))
-    raise TypeError(f"Unsupported state type: {type(lhs)}")
-
-
-def mean_squared_error_state(pred: StateLike, target: StateLike) -> Tuple[torch.Tensor, float]:
-    losses: List[torch.Tensor] = []
-
-    def collect(lhs: StateLike, rhs: StateLike):
-        if torch.is_tensor(lhs):
-            losses.append(F.mse_loss(lhs, rhs))
-            return
-        if isinstance(lhs, list):
-            for lv, rv in zip(lhs, rhs):
-                collect(lv, rv)
-            return
-        if isinstance(lhs, tuple):
-            for lv, rv in zip(lhs, rhs):
-                collect(lv, rv)
-            return
-        raise TypeError(f"Unsupported state type: {type(lhs)}")
-
-    collect(pred, target)
-    if not losses:
-        raise ValueError("No tensor leaves found in state.")
-    loss = torch.stack(losses).mean()
-    return loss, float(loss.detach().cpu().item())
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from state_utils import (  # noqa: F401  (re-exported for backwards compat)
+    StateLike,
+    _apply_state,
+    _path_to_wkv_layer,
+    add_states,
+    clone_state,
+    mean_squared_error_state,
+    move_state_to_cpu,
+    move_state_to_device,
+    stack_states,
+    unstack_states,
+)
 
 
 @dataclass

@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import os
 import re
@@ -7,7 +6,6 @@ from collections import OrderedDict
 from typing import Dict, List, Sequence
 
 import matplotlib.pyplot as plt
-import torch
 from matplotlib import rcParams
 from tqdm import tqdm
 
@@ -20,6 +18,7 @@ from rwkv_model import (
     load_validation_state_dataset,
     squad_em,
 )
+from state_utils import mean_states
 
 
 def parse_args():
@@ -32,33 +31,6 @@ def parse_args():
     parser.add_argument("--state-dir", type=str, default="")
     parser.add_argument("--group-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
     return parser.parse_args()
-
-
-def merge_states(states: Sequence):
-    merged = copy.deepcopy(states[0])
-    for state in states[1:]:
-        merged = _add_state(merged, state)
-    return _scale_state(merged, 1.0 / len(states))
-
-
-def _add_state(lhs, rhs):
-    if torch.is_tensor(lhs):
-        return lhs + rhs
-    if isinstance(lhs, tuple):
-        return tuple(_add_state(lv, rv) for lv, rv in zip(lhs, rhs))
-    if isinstance(lhs, list):
-        return [_add_state(lv, rv) for lv, rv in zip(lhs, rhs)]
-    raise TypeError(f"Unsupported state type: {type(lhs)}")
-
-
-def _scale_state(state, factor: float):
-    if torch.is_tensor(state):
-        return state * factor
-    if isinstance(state, tuple):
-        return tuple(_scale_state(v, factor) for v in state)
-    if isinstance(state, list):
-        return [_scale_state(v, factor) for v in state]
-    raise TypeError(f"Unsupported state type: {type(state)}")
 
 
 def init_mode_record_file(output_dir: str, mode_name: str) -> str:
@@ -289,7 +261,7 @@ def evaluate_with_state_merge(
             break
         group_rows = [dataset[i] for i in range(start, start + group_size)]
         group_states = [row["state"] for row in group_rows]
-        merged_state = merge_states(group_states)
+        merged_state = mean_states(group_states)
         for idx_in_group, row in enumerate(group_rows):
             pred = rwkv.generate(question=row["question"], init_state=merged_state, max_new_tokens=max_new_tokens)
             answers = row.get("answers", [])

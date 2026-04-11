@@ -1,10 +1,15 @@
 import argparse
+import math
 import os
-from typing import Any, Dict, List, Tuple
+import sys
+from typing import Any, Dict, List
 
 import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from state_utils import _is_wkv_path
 
 
 def parse_args():
@@ -35,21 +40,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def _is_wkv_path(path: Tuple[int, ...]) -> bool:
-    # RWKV state layout: top-level idx % 3 == 1 corresponds to WKV matrix state.
-    return len(path) == 1 and (path[0] % 3 == 1)
-
-
 def extract_wkv_by_layer(state: Any) -> List[torch.Tensor]:
     layer_map: Dict[int, torch.Tensor] = {}
 
-    def walk(x: Any, path: Tuple[int, ...]):
+    def walk(x: Any, path: tuple):
         if torch.is_tensor(x):
             if _is_wkv_path(path):
                 layer_idx = path[0] // 3
                 if x.ndim < 3:
                     raise ValueError(f"WKV tensor must be >=3D [head,...,H,W], got {tuple(x.shape)}")
-                heads = int(torch.tensor(x.shape[:-2]).prod().item())
+                heads = int(math.prod(x.shape[:-2]))
                 h, w = int(x.shape[-2]), int(x.shape[-1])
                 layer_map[layer_idx] = x.reshape(heads, h, w).float()
             return
@@ -166,6 +166,15 @@ def plot_layer_mean_line(values: torch.Tensor, output_path: str, metric: str, sp
 
     fig, ax = plt.subplots(figsize=(10, 4.5), dpi=150)
     ax.plot(x, layer_mean, color="#1f77b4", linewidth=2.0, marker="o", markersize=3.5)
+    for xi, yi in zip(x, layer_mean):
+        ax.text(
+            xi,
+            yi,
+            f"{yi:.3f}",
+            fontsize=8,
+            ha="center",
+            va="bottom",
+        )
     ax.set_xlabel("Layer")
     ax.set_ylabel(f"Mean Gap ({metric.upper()})")
     ax.set_title(f"Layer-wise Mean Gap of ((S_A + S_B)/2 - S_AB) | split={split}")

@@ -1,14 +1,14 @@
 import math
+import os
+import sys
 from typing import Any, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-def _is_wkv_path(path: List[int]) -> bool:
-    # RWKV state layout: layer*3+1 is WKV matrix state.
-    return len(path) == 1 and (path[0] % 3 == 1)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from state_utils import _is_wkv_path, move_state_to_device  # noqa: F401
 
 
 class _LayerMixerBlock(nn.Module):
@@ -143,16 +143,6 @@ class DynamicStateMixer(nn.Module):
 PointwiseKernelMixer = DynamicStateMixer
 
 
-def move_state_to_device(state: Any, device: torch.device | str):
-    if isinstance(state, list):
-        return [move_state_to_device(x, device) for x in state]
-    if isinstance(state, tuple):
-        return tuple(move_state_to_device(x, device) for x in state)
-    if torch.is_tensor(state):
-        return state.to(device)
-    return state
-
-
 def _count_layers_heads_spatial(state: Any) -> tuple[int, int, int, int]:
     layer_specs: List[tuple[int, int, int]] = []
 
@@ -189,12 +179,27 @@ def count_layers_heads_from_state(state: Any) -> tuple[int, int, int, int]:
 
 
 class HeadwiseStateMixer(nn.Module):
+    """Tree-aware wrapper around a per-layer state merger.
+
+    The inner merger class (`mixer_cls`) must accept
+    `(num_layers, heads_per_layer, height, width, **mixer_kwargs)` in its
+    constructor and expose `forward(x: [B, 2*N, H, W]) -> dict` with a
+    `"mixed"` key of shape `[B, N, H, W]`. The layout of the channel
+    dimension is `[A_all_layer_major, B_all_layer_major]`.
+
+    Defaults to `DynamicStateMixer` (the convolutional merger) but any
+    compatible module works — see `tiny_rwkv_merger.TinyRWKVStateMerger`
+    for the tiny RWKV-like variant.
+    """
+
     def __init__(
         self,
         mse_weight: float = 1.0,
         l1_weight: float = 0.2,
         cosine_weight: float = 0.2,
         rec_tol: float = 1e-3,
+        mixer_cls: type[nn.Module] | None = None,
+        mixer_kwargs: dict | None = None,
     ):
         super().__init__()
         self.mse_weight = mse_weight
@@ -204,12 +209,18 @@ class HeadwiseStateMixer(nn.Module):
         self._num_units = 0
         self._num_layers = 0
         self._heads_per_layer = 0
-        self._mixer: DynamicStateMixer | None = None
+        self._mixer: nn.Module | None = None
         self._built = False
+        self._mixer_cls: type[nn.Module] = mixer_cls or DynamicStateMixer
+        self._mixer_kwargs: dict = dict(mixer_kwargs or {})
 
     @property
     def num_groups(self) -> int:
         return self._num_units
+
+    @property
+    def inner_mixer(self) -> nn.Module | None:
+        return self._mixer
 
     def build_from_state(self, state: Any):
         if self._built:
@@ -220,7 +231,7 @@ class HeadwiseStateMixer(nn.Module):
         self._num_units = num_layers * heads
         if self._num_units < 1:
             raise ValueError("State has no valid tensor leaves.")
-        self._mixer = DynamicStateMixer(num_layers, heads, h, w)
+        self._mixer = self._mixer_cls(num_layers, heads, h, w, **self._mixer_kwargs)
         self._built = True
 
     def _tensor_loss(self, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
@@ -299,7 +310,11 @@ class HeadwiseStateMixer(nn.Module):
             raise ValueError(f"Unit count mismatch: expected {self._num_units}, got {n}")
         tgt_flat = torch.cat(chunks_t, dim=0) if chunks_t else None
 
-        x = torch.stack([lhs_flat, rhs_flat], dim=1).reshape(1, 2 * n, h, w).to(dev)
+        # Layer-major A then layer-major B: x[:, :n] is A, x[:, n:] is B.
+        # (The previous `torch.stack([lhs, rhs], dim=1).reshape(1, 2n, h, w)` call
+        # interleaved A/B per head, which broke the xa/xb split inside the inner
+        # mixer — the merger was being trained on a scrambled channel layout.)
+        x = torch.cat([lhs_flat, rhs_flat], dim=0).unsqueeze(0).to(dev)
         out = self._mixer(x)
         mixed_flat = out["mixed"].squeeze(0)
 

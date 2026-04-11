@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import os
 from collections import OrderedDict
@@ -18,6 +17,8 @@ from rwkv_model import (
     load_validation_state_dataset,
     squad_em,
 )
+from state_utils import clone_state
+from svd_utils import rank_from_threshold, truncated_svd_reconstruct_by_threshold
 
 
 def parse_args():
@@ -30,40 +31,6 @@ def parse_args():
     parser.add_argument("--state-dir", type=str, default="")
     parser.add_argument("--sv-thresholds", type=float, nargs="+", default=[1.00, 0.95, 0.90, 0.85, 0.80, 0.75])
     return parser.parse_args()
-
-
-def clone_state(state):
-    if isinstance(state, list):
-        return [clone_state(x) for x in state]
-    if isinstance(state, tuple):
-        return tuple(clone_state(x) for x in state)
-    if torch.is_tensor(state):
-        return state.clone()
-    return copy.deepcopy(state)
-
-
-def rank_from_threshold(singular_values: torch.Tensor, threshold: float) -> int:
-    total = singular_values.sum()
-    if total <= 0:
-        return 1
-    cumsum = torch.cumsum(singular_values, dim=0)
-    target = float(threshold) * float(total.item())
-    k = int(torch.searchsorted(cumsum, torch.tensor(target, device=cumsum.device), right=False).item()) + 1
-    return max(1, min(k, singular_values.shape[0]))
-
-
-def truncated_svd_reconstruct_by_threshold(matrix: torch.Tensor, threshold: float):
-    orig_dtype = matrix.dtype
-    work = matrix.float()
-    u, s, vh = torch.linalg.svd(work, full_matrices=False)
-    k = rank_from_threshold(s, threshold)
-    u_k = u[:, :k]
-    s_k = s[:k]
-    vh_k = vh[:k, :]
-    recon = (u_k * s_k.unsqueeze(0)) @ vh_k
-    d = int(s.shape[0])
-    compression = (2.0 * float(k)) / float(d)
-    return recon.to(dtype=orig_dtype), compression
 
 
 def apply_svd_ratio_to_wkv_state(state, threshold: float):

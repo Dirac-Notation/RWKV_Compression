@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import os
 from collections import OrderedDict
@@ -18,6 +17,7 @@ from rwkv_model import (
     load_validation_state_dataset,
     squad_em,
 )
+from state_utils import clone_state
 
 
 def parse_args():
@@ -30,16 +30,6 @@ def parse_args():
     parser.add_argument("--state-dir", type=str, default="")
     parser.add_argument("--svd-ranks", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64])
     return parser.parse_args()
-
-
-def clone_state(state):
-    if isinstance(state, list):
-        return [clone_state(x) for x in state]
-    if isinstance(state, tuple):
-        return tuple(clone_state(x) for x in state)
-    if torch.is_tensor(state):
-        return state.clone()
-    return copy.deepcopy(state)
 
 
 def truncated_svd_reconstruct_topk(matrix: torch.Tensor, rank: int):

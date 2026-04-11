@@ -21,7 +21,9 @@ from rwkv_model import (
     load_validation_state_dataset,
     squad_em,
 )
-from state_merge.mixer import HeadwiseStateMixer, move_state_to_device
+from state_merge.mixer import DynamicStateMixer, HeadwiseStateMixer
+from state_merge.tiny_rwkv_merger import TinyRWKVMergerConfig, TinyRWKVStateMerger
+from state_utils import _is_wkv_path, move_state_to_device
 
 
 def parse_args():
@@ -45,11 +47,6 @@ def mixer_merge_states(mixer: HeadwiseStateMixer, state_a: Any, state_b: Any):
     sb = move_state_to_device(state_b, "cpu")
     mixed_wkv = mixer(sa, sb)["mixed"]
     return merge_state_with_avg_non_wkv(sa, sb, mixed_wkv, ())
-
-
-def _is_wkv_path(path: tuple[int, ...]) -> bool:
-    # RWKV state layout: idx % 3 == 1 is WKV state.
-    return len(path) == 1 and (path[0] % 3 == 1)
 
 
 def merge_state_with_avg_non_wkv(lhs: Any, rhs: Any, mixed_wkv: Any, path: tuple[int, ...]):
@@ -328,22 +325,51 @@ def evaluate_mixer_merge_2(
     return {"accuracy": (correct / total) if total else 0.0}
 
 
+def _build_headwise_for_kind(model_kind: str, ckpt_args: dict | None) -> HeadwiseStateMixer:
+    """Return an unbuilt HeadwiseStateMixer wired to the right inner mixer class."""
+    if model_kind == "conv":
+        return HeadwiseStateMixer(mixer_cls=DynamicStateMixer)
+    if model_kind == "tiny_rwkv":
+        ckpt_args = ckpt_args or {}
+        config = TinyRWKVMergerConfig(
+            d_model=int(ckpt_args.get("d_model", 32)),
+            d_ffn=int(ckpt_args.get("d_ffn", 64)),
+            max_layers=int(ckpt_args.get("max_layers", 128)),
+            use_low_rank_mask=not bool(ckpt_args.get("no_low_rank_mask", False)),
+            dropout=float(ckpt_args.get("dropout", 0.0)),
+        )
+        return HeadwiseStateMixer(
+            mixer_cls=TinyRWKVStateMerger,
+            mixer_kwargs={"config": config},
+        )
+    raise ValueError(f"Unknown model_kind in checkpoint: {model_kind!r}")
+
+
 def load_mixer(ckpt_path: str, sample_state: Any) -> HeadwiseStateMixer:
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    else:
-        state_dict = ckpt
-    model = HeadwiseStateMixer()
-    model.build_from_state(sample_state)
-    has_prefixed = any(k.startswith("_mixer.") for k in state_dict.keys())
-    if not has_prefixed:
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
         raise RuntimeError(
-            f"Checkpoint format mismatch: expected HeadwiseStateMixer keys ('_mixer.*'), got: {ckpt_path}. "
+            f"Checkpoint format mismatch: expected dict with 'model_state_dict', got {ckpt_path}."
+        )
+    state_dict = ckpt["model_state_dict"]
+    # Back-compat: older checkpoints (pre-pivot) have no 'model_kind' key.
+    # Those were all conv-based.
+    model_kind = ckpt.get("model_kind", "conv")
+    ckpt_args = ckpt.get("args")
+    model = _build_headwise_for_kind(model_kind, ckpt_args)
+    model.build_from_state(sample_state)
+
+    if not any(k.startswith("_mixer.") for k in state_dict.keys()):
+        raise RuntimeError(
+            f"Checkpoint state_dict does not contain '_mixer.*' keys: {ckpt_path}. "
             "Please use a unified checkpoint saved by the current train_mixer.py."
         )
     model.load_state_dict(state_dict)
     model.eval()
+    print(
+        f"[load_mixer] kind={model_kind} "
+        f"params={sum(p.numel() for p in model.parameters()):,}"
+    )
     return model
 
 

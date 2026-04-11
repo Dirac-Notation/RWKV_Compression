@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import os
 import re
@@ -20,6 +19,7 @@ from rwkv_model import (
     load_validation_state_dataset,
     squad_em,
 )
+from state_utils import clone_state
 
 
 def parse_args():
@@ -35,16 +35,6 @@ def parse_args():
     parser.add_argument("--bits", type=int, nargs="+", default=[4, 8])
     parser.add_argument("--outlier-frac", type=float, default=0.1, help="Fraction of elements (by |x|) treated as outliers for scaled mode (default: top 10%%).")
     return parser.parse_args()
-
-
-def clone_state(state):
-    if isinstance(state, list):
-        return [clone_state(x) for x in state]
-    if isinstance(state, tuple):
-        return tuple(clone_state(x) for x in state)
-    if torch.is_tensor(state):
-        return state.clone()
-    return copy.deepcopy(state)
 
 
 def _dtype_bits(t: torch.Tensor) -> int:

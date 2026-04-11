@@ -1,8 +1,8 @@
 import argparse
-import copy
 import json
 import os
 import re
+import sys
 from collections import OrderedDict
 from typing import Dict, List, Sequence
 
@@ -18,13 +18,15 @@ os.environ.setdefault("RWKV_CUDA_ON", "0")
 from rwkv.model import RWKV
 from rwkv.utils import PIPELINE, PIPELINE_ARGS
 
-from state_autoencoder import (
-    AutoEncoderConfig,
-    StateStructureAutoEncoder,
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from rwkv_model import resolve_rwkv_model_path
+from state_autoencoder import AutoEncoderConfig, StateStructureAutoEncoder
+from state_utils import (
     add_states,
     clone_state,
     move_state_to_cpu,
     move_state_to_device,
+    scale_state,
 )
 
 
@@ -39,50 +41,6 @@ def parse_args():
     parser.add_argument("--group-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
     parser.add_argument("--output-dir", type=str, default="./encode_compress/eval_outputs")
     return parser.parse_args()
-
-
-def resolve_rwkv_model_path(model_path: str, model_filename: str = "") -> str:
-    if os.path.isfile(model_path):
-        if model_path.endswith(".pth"):
-            return model_path[:-4]
-        return model_path
-    if os.path.isfile(model_path + ".pth"):
-        return model_path
-    if model_path.endswith(".pth"):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-    if "/" not in model_path:
-        raise FileNotFoundError(
-            f"Invalid model path '{model_path}'. "
-            "Use local .pth path or Hugging Face repo id like 'BlinkDL/rwkv7-g1'."
-        )
-    try:
-        from huggingface_hub import hf_hub_download, list_repo_files
-    except ImportError as e:
-        raise ImportError(
-            "huggingface_hub is required for auto download. "
-            "Install it with: pip install huggingface_hub"
-        ) from e
-    repo_files = list_repo_files(repo_id=model_path)
-    pth_files = [f for f in repo_files if f.endswith(".pth")]
-    if not pth_files:
-        raise FileNotFoundError(f"No .pth file found in Hugging Face repo: {model_path}")
-
-    target_file = model_filename or sorted(pth_files)[-1]
-    if target_file not in pth_files:
-        raise FileNotFoundError(
-            f"'{target_file}' not found in repo {model_path}. Available: {pth_files}"
-        )
-    model_dir = os.path.join(os.getcwd(), "models")
-    os.makedirs(model_dir, exist_ok=True)
-    local_path = hf_hub_download(
-        repo_id=model_path,
-        filename=target_file,
-        local_dir=model_dir,
-        local_dir_use_symlinks=False,
-    )
-    if not local_path.endswith(".pth"):
-        raise RuntimeError(f"Downloaded file is not a .pth model: {local_path}")
-    return local_path[:-4]
 
 
 def build_question_prompt(question: str) -> str:
@@ -177,16 +135,6 @@ def append_mode_record(path: str, row: Dict[str, object]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
         f.flush()
-
-
-def _scale_state(state, factor: float):
-    if torch.is_tensor(state):
-        return state * factor
-    if isinstance(state, tuple):
-        return tuple(_scale_state(v, factor) for v in state)
-    if isinstance(state, list):
-        return [_scale_state(v, factor) for v in state]
-    raise TypeError(f"Unsupported state type: {type(state)}")
 
 
 def apply_plot_style():
@@ -460,10 +408,10 @@ def evaluate_merge_ae(
             break
 
         latent_group = [encode_state_with_ae(ae, row["state"], device) for row in group]
-        merged_latent = copy.deepcopy(latent_group[0])
+        merged_latent = clone_state(latent_group[0])
         for latent in latent_group[1:]:
             merged_latent = add_states(merged_latent, latent)
-        merged_latent = _scale_state(merged_latent, 1.0 / group_size)
+        merged_latent = scale_state(merged_latent, 1.0 / group_size)
         merged_state = decode_latent_with_ae(ae, merged_latent, device)
 
         for row in group:

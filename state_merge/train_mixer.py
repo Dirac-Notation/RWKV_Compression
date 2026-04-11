@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Any, Dict, List, Tuple
@@ -11,10 +12,22 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from state_merge.mixer import DynamicStateMixer, count_layers_heads_from_state
+from state_merge.tiny_rwkv_merger import TinyRWKVMergerConfig, TinyRWKVStateMerger
+from state_utils import _is_wkv_path
+
+
+MODEL_KINDS = ("tiny_rwkv", "conv")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train convolutional state mixer.")
+    parser = argparse.ArgumentParser(description="Train state merger (tiny RWKV or conv).")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="tiny_rwkv",
+        choices=MODEL_KINDS,
+        help="Merger architecture: 'tiny_rwkv' (default) or legacy 'conv'.",
+    )
     parser.add_argument("--dataset-dir", type=str, default="./data")
     parser.add_argument("--train-split", type=str, default="train")
     parser.add_argument("--val-split", type=str, default="val")
@@ -30,7 +43,33 @@ def parse_args():
     parser.add_argument("--cosine-weight", type=float, default=0.2)
     parser.add_argument("--rec-tol", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    # Tiny RWKV hyperparameters (only used when --model=tiny_rwkv).
+    parser.add_argument("--d-model", type=int, default=32)
+    parser.add_argument("--d-ffn", type=int, default=64)
+    parser.add_argument("--max-layers", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--no-low-rank-mask",
+        action="store_true",
+        help="Disable low-rank per-element mask (use only per-head scalar gate).",
+    )
     return parser.parse_args()
+
+
+def build_merger(args, num_layers: int, heads: int, h: int, w: int) -> torch.nn.Module:
+    """Construct the merger model requested by `--model`."""
+    if args.model == "conv":
+        return DynamicStateMixer(num_layers, heads, h, w)
+    if args.model == "tiny_rwkv":
+        config = TinyRWKVMergerConfig(
+            d_model=args.d_model,
+            d_ffn=args.d_ffn,
+            max_layers=max(args.max_layers, num_layers),
+            use_low_rank_mask=not args.no_low_rank_mask,
+            dropout=args.dropout,
+        )
+        return TinyRWKVStateMerger(num_layers, heads, h, w, config=config)
+    raise ValueError(f"Unknown --model={args.model}")
 
 
 def _split_dirs(dataset_dir: str, split_name: str):
@@ -191,10 +230,11 @@ def main():
             f"WKV unit count mismatch: dataset num_groups={train_ds.num_groups} "
             f"vs num_layers*heads={num_layers * heads}"
         )
-    model = DynamicStateMixer(num_layers, heads, h, w)
+    model = build_merger(args, num_layers, heads, h, w)
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
-        f"[init] mixer layers={num_layers} heads_per_layer={heads} "
-        f"total_units={train_ds.num_groups}"
+        f"[init] model={args.model} layers={num_layers} heads_per_layer={heads} "
+        f"total_units={train_ds.num_groups} trainable_params={num_params:,}"
     )
     model = model.to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -231,10 +271,18 @@ def main():
 
         ckpt = {
             "epoch": epoch,
+            "model_kind": args.model,
             "model_state_dict": _to_headwise_state_dict(model.state_dict()),
             # Keep raw mixer keys for optional direct mixer-only loading.
             "mixer_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "model_shape": {
+                "num_layers": num_layers,
+                "heads_per_layer": heads,
+                "height": h,
+                "width": w,
+            },
+            "num_parameters": num_params,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "train_recall": train_recall,
@@ -252,10 +300,6 @@ def main():
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-def _is_wkv_path(path: Tuple[int, ...]) -> bool:
-    return len(path) == 1 and (path[0] % 3 == 1)
-
-
 def extract_wkv_units(state: Any) -> torch.Tensor:
     chunks: List[torch.Tensor] = []
 
@@ -264,7 +308,7 @@ def extract_wkv_units(state: Any) -> torch.Tensor:
             if _is_wkv_path(path):
                 if x.ndim < 2:
                     raise ValueError(f"WKV tensor must be >=2D, got shape={tuple(x.shape)}")
-                n = int(torch.tensor(x.shape[:-2]).prod().item())
+                n = int(math.prod(x.shape[:-2]))
                 h, w = x.shape[-2], x.shape[-1]
                 chunks.append(x.reshape(n, h, w).float())
             return

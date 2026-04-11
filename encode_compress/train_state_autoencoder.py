@@ -109,7 +109,7 @@ def main():
     )
     val_loader = DataLoader(
         val_ds,
-        atch_size=batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_states,

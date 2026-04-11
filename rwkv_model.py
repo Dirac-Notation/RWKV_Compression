@@ -1,8 +1,7 @@
-import copy
 import json
 import os
 import re
-from typing import Any, List
+from typing import List
 
 import torch
 from torch.utils.data import Dataset
@@ -13,6 +12,9 @@ os.environ.setdefault("RWKV_CUDA_ON", "0")
 
 from rwkv.model import RWKV
 from rwkv.utils import PIPELINE, PIPELINE_ARGS
+
+# Re-exported so existing `from rwkv_model import clone_state` imports keep working.
+from state_utils import clone_state, move_state_to_cpu, move_state_to_device  # noqa: F401
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. "
@@ -70,36 +72,6 @@ def resolve_rwkv_model_path(model_path: str, model_filename: str = "") -> str:
     if not local_path.endswith(".pth"):
         raise RuntimeError(f"Downloaded file is not a .pth model: {local_path}")
     return local_path[:-4]
-
-
-def clone_state(state: Any):
-    if isinstance(state, list):
-        return [clone_state(x) for x in state]
-    if isinstance(state, tuple):
-        return tuple(clone_state(x) for x in state)
-    if torch.is_tensor(state):
-        return state.clone()
-    return copy.deepcopy(state)
-
-
-def move_state_to_device(state: Any, device: torch.device | str):
-    if isinstance(state, list):
-        return [move_state_to_device(x, device) for x in state]
-    if isinstance(state, tuple):
-        return tuple(move_state_to_device(x, device) for x in state)
-    if torch.is_tensor(state):
-        return state.to(device)
-    return state
-
-
-def move_state_to_cpu(state: Any):
-    if isinstance(state, list):
-        return [move_state_to_cpu(x) for x in state]
-    if isinstance(state, tuple):
-        return tuple(move_state_to_cpu(x) for x in state)
-    if torch.is_tensor(state):
-        return state.detach().cpu()
-    return state
 
 
 def strip_pth_suffix(model_filename: str) -> str:
