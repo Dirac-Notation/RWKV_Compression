@@ -11,70 +11,249 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from state_utils import _is_wkv_path, move_state_to_device  # noqa: F401
 
 
-class _LayerMixerBlock(nn.Module):
+# ---------------------------------------------------------------------------
+# Per-head summary statistics
+# ---------------------------------------------------------------------------
+
+def _head_stats_pair(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Per-head joint stats of two WKV matrices.
+
+    a, b: [B, H_per, H, W]  →  [B, H_per, 12]
+    Layout: 4 stats (mean/std/min/max) for A, 4 for B, then
+    diff_mean / diff_std / diff_l2 / cosine(A, B).
     """
-    One layer: inputs are A_ell, B_ell, and previous layer merged AB_{ell-1} (same head layout).
-    Output is AB_ell (same shape as A_ell).
+    a_flat = a.reshape(*a.shape[:-2], -1)
+    b_flat = b.reshape(*b.shape[:-2], -1)
+
+    a_mean, a_std = a_flat.mean(-1), a_flat.std(-1)
+    a_min, a_max = a_flat.amin(-1), a_flat.amax(-1)
+    b_mean, b_std = b_flat.mean(-1), b_flat.std(-1)
+    b_min, b_max = b_flat.amin(-1), b_flat.amax(-1)
+
+    diff = a_flat - b_flat
+    d_mean = diff.mean(-1)
+    d_std = diff.std(-1)
+    d_l2 = diff.norm(dim=-1)
+    cos = F.cosine_similarity(a_flat, b_flat, dim=-1)
+
+    return torch.stack(
+        [a_mean, a_std, a_min, a_max, b_mean, b_std, b_min, b_max, d_mean, d_std, d_l2, cos],
+        dim=-1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MatrixMergerBlock — replaces the old _LayerMixerBlock
+# ---------------------------------------------------------------------------
+
+class MatrixMergerBlock(nn.Module):
+    """One per-layer merger block, matrix-aware (NOT convolutional).
+
+    Operates on a single layer's two WKV matrices `(A_ell, B_ell)` of shape
+    `[B, H_per, H, W]` and emits a merged tensor of the same shape. The
+    architecture treats H, W as feature dimensions of a matrix-valued state,
+    not as spatial axes of an image — there are no convolutions on the H/W
+    plane (those would impose a spurious locality prior).
+
+    Per-head feature pipeline:
+        1. Compute 12-dim per-head joint stats of (A, B).
+        2. Project to `d_model`, add a per-layer embedding (set externally).
+        3. Cross-head Multi-Head Self-Attention (heads talk to each other).
+        4. Channel-mixing FFN.
+
+    Output decoder (per-element merge mask via low-rank factors):
+        mask_logit[h, i, j] = scalar_gate[h] + row_factor[h, i] + col_factor[h, j]
+        mask = sigmoid(mask_logit) ∈ [0, 1]^{H_per × H × W}
+        merged = mask * A + (1 - mask) * B + delta
+    where `delta = scale * u_row · u_col^T` is a tiny low-rank residual that
+    lets the model escape the convex-combination corner case (init scale=0).
+
+    All output heads are zero-init so the merger starts as a pure average.
     """
 
-    def __init__(self, heads_per_layer: int, height: int, width: int):
+    def __init__(
+        self,
+        heads_per_layer: int,
+        height: int,
+        width: int,
+        d_model: int = 32,
+        n_attn_heads: int = 2,
+        d_ffn: int | None = None,
+        delta_rank: int = 1,
+    ):
         super().__init__()
         if heads_per_layer < 1:
             raise ValueError(f"heads_per_layer must be >= 1, got {heads_per_layer}")
+        if d_model % n_attn_heads != 0:
+            raise ValueError(
+                f"d_model={d_model} must be divisible by n_attn_heads={n_attn_heads}"
+            )
+        if delta_rank < 1:
+            raise ValueError(f"delta_rank must be >= 1, got {delta_rank}")
         self.heads_per_layer = heads_per_layer
         self.height = height
         self.width = width
-        hidden_dim = max(8, heads_per_layer // 3)
-        self.context_mlp = nn.Sequential(
-            nn.Linear(heads_per_layer * 3, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, heads_per_layer * 2),
+        self.d_model = d_model
+        self.delta_rank = delta_rank
+        d_ffn = d_ffn or 2 * d_model
+        self.stats_dim = 12
+
+        self.in_proj = nn.Linear(self.stats_dim, d_model)
+
+        # Cross-head transformer block (heads as the "sequence").
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, n_attn_heads, batch_first=True, bias=True
         )
-        self.spatial_conv = nn.Conv2d(heads_per_layer * 3, heads_per_layer * 2, kernel_size=1, bias=True)
-        nn.init.normal_(self.spatial_conv.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.spatial_conv.bias)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ffn),
+            nn.GELU(),
+            nn.Linear(d_ffn, d_model),
+        )
 
-    def forward(self, x: torch.Tensor):
-        if x.dim() != 4:
-            raise ValueError(f"Expected 4D [B, 3*H, h, w], got {tuple(x.shape)}")
-        if x.size(1) != 3 * self.heads_per_layer:
+        # Mask output (low-rank per-element via row + col factors).
+        self.gate_head = nn.Linear(d_model, 1)
+        self.row_head = nn.Linear(d_model, height)
+        self.col_head = nn.Linear(d_model, width)
+
+        # Non-convex residual: rank-K decomposition delta = sum_k u_k · v_k^T.
+        self.delta_row_head = nn.Linear(d_model, height * delta_rank)
+        self.delta_col_head = nn.Linear(d_model, width * delta_rank)
+        self.delta_scale = nn.Parameter(torch.zeros(()))
+
+        self._init_output_heads()
+
+    def _init_output_heads(self) -> None:
+        # Mask path: zero everything so init mask = sigmoid(0) = 0.5 → pure avg.
+        for head in (self.gate_head, self.row_head, self.col_head):
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+        # Delta path: zero weight + non-zero bias on each factor, and zero scale.
+        # The product `delta_row · delta_col^T` is then a non-zero constant matrix
+        # (so `∂loss/∂delta_scale` is non-zero from step 0), but `delta_scale=0`
+        # keeps the actual `delta` exactly zero at init. Once scale moves, the
+        # row/col weights start receiving non-zero gradients too.
+        nn.init.zeros_(self.delta_row_head.weight)
+        nn.init.constant_(self.delta_row_head.bias, 0.5)
+        nn.init.zeros_(self.delta_col_head.weight)
+        nn.init.constant_(self.delta_col_head.bias, 0.5)
+        # delta_scale already zero-init via the constructor
+
+    def forward(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_emb: torch.Tensor | None = None,
+    ) -> dict:
+        """a, b: [B, H_per, H, W]; layer_emb: [d_model] or None."""
+        if a.shape != b.shape:
+            raise ValueError(f"a/b shape mismatch: {tuple(a.shape)} vs {tuple(b.shape)}")
+        if a.dim() != 4:
+            raise ValueError(f"Expected 4D [B, H_per, H, W], got {tuple(a.shape)}")
+        if a.size(2) != self.height or a.size(3) != self.width:
             raise ValueError(
-                f"Expected channel size 3*H={3 * self.heads_per_layer}, got {x.size(1)}"
+                f"Spatial mismatch: got {(a.size(2), a.size(3))}, "
+                f"expected {(self.height, self.width)}"
             )
-        if x.size(2) != self.height or x.size(3) != self.width:
+        if a.size(1) != self.heads_per_layer:
             raise ValueError(
-                f"Expected spatial size {(self.height, self.width)}, got {(x.size(2), x.size(3))}"
+                f"Head count mismatch: got {a.size(1)}, expected {self.heads_per_layer}"
             )
 
-        bsz, _, h, w = x.shape
-        xg = x.view(bsz, self.heads_per_layer, 3, h, w)
-        global_context = xg.mean(dim=(-2, -1)).reshape(bsz, self.heads_per_layer * 3)
-        global_logits = self.context_mlp(global_context).view(bsz, self.heads_per_layer, 2, 1, 1)
-        spatial_logits = self.spatial_conv(x).view(bsz, self.heads_per_layer, 2, h, w)
-        logits = global_logits + spatial_logits
+        bsz = a.size(0)
+        h, w = self.height, self.width
 
-        weight_b = torch.sigmoid(logits[:, :, 1] - logits[:, :, 0])
-        weight_a = 1.0 - weight_b
-        coeff = torch.stack([weight_a, weight_b], dim=2)
-        xa = xg[:, :, 0]
-        xb = xg[:, :, 1]
-        mixed = xa + weight_b * (xb - xa)
+        # 1) Per-head joint stats → d_model features.
+        stats = _head_stats_pair(a, b)  # [B, H_per, 12]
+        feat = self.in_proj(stats)  # [B, H_per, d_model]
+        if layer_emb is not None:
+            feat = feat + layer_emb  # broadcast [d_model] over [B, H_per, d_model]
+
+        # 2) Cross-head attention (heads as the seq dim — permutation-equivariant).
+        attn_in = self.attn_norm(feat)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        feat = feat + attn_out
+
+        # 3) Channel-mixing FFN.
+        feat = feat + self.ffn(self.ffn_norm(feat))  # [B, H_per, d_model]
+
+        # 4) Decode mask + residual.
+        gate = self.gate_head(feat)  # [B, H_per, 1]
+        row = self.row_head(feat)  # [B, H_per, H]
+        col = self.col_head(feat)  # [B, H_per, W]
+        mask_logit = (
+            gate.unsqueeze(-1)  # [B, H_per, 1, 1]
+            + row.unsqueeze(-1)  # [B, H_per, H, 1]
+            + col.unsqueeze(-2)  # [B, H_per, 1, W]
+        )  # [B, H_per, H, W]
+        mask = torch.sigmoid(mask_logit)
+
+        # Rank-K residual delta = scale * sum_k row_k · col_k^T.
+        bsz_local, hp_local = feat.size(0), feat.size(1)
+        d_row = self.delta_row_head(feat).view(bsz_local, hp_local, self.delta_rank, h)
+        d_col = self.delta_col_head(feat).view(bsz_local, hp_local, self.delta_rank, w)
+        delta = self.delta_scale * torch.einsum("bhki,bhkj->bhij", d_row, d_col)  # [B, H_per, H, W]
+
+        merged = mask * a + (1.0 - mask) * b + delta
+
         return {
-            "logits": logits,
-            "coeff": coeff,
-            "weight_a": weight_a,
-            "weight_b": weight_b,
-            "mixed": mixed,
+            "mixed": merged,
+            "mask": mask,
+            "delta": delta,
+            "feat": feat,
         }
 
 
+# Backwards-compat alias — older imports / pickles refer to `_LayerMixerBlock`.
+_LayerMixerBlock = MatrixMergerBlock
+
+
 class DynamicStateMixer(nn.Module):
-    """
-    Layer-wise sequential mixer: layer ell uses A_ell, B_ell, and AB_{ell-1}
-    (zeros for ell == 0). Each layer has its own parameters.
+    """Per-layer matrix-aware state merger (replaces the conv-based design).
+
+    Forward input: `x` of shape `[B, 2*N, H, W]` where
+        N = num_layers * heads_per_layer
+    and the channel layout is `[A_all_layer_major, B_all_layer_major]`.
+
+    For each RWKV layer ell, the mixer
+        1. slices `(A_ell, B_ell)` out of `x`,
+        2. fetches a learnable layer embedding,
+        3. runs them through a *shared* `MatrixMergerBlock`,
+    and stacks the per-layer outputs back into `[B, N, H, W]`.
+
+    Compared to the previous convolutional design this:
+      - No longer pretends WKV matrices are images (no Conv2d on H, W).
+      - Lets every head talk to every other head in the same layer via
+        attention (the old design had no cross-head info flow at all).
+      - Uses a *shared* per-layer block, distinguished only by a layer
+        embedding, which collapses parameter count from O(L · d²) to O(d²).
+      - Produces per-element masks via low-rank row+col factors instead of
+        the old per-head scalar gate.
+      - Has an additive low-rank residual `delta` so the merged value is no
+        longer constrained to live element-wise between A and B.
+      - Drops the single-step `prev_AB` recurrence (which was too weak to
+        capture depth-dependent merging strategies); see `tiny_rwkv_merger`
+        for the recurrent variant.
+
+    The legacy `prev_AB` carry-over and per-layer block buggy channel
+    interleave that the old conv design had are gone — there is no
+    `torch.cat([A, B, prev], dim=1)` step that needed careful interpretation,
+    so the corresponding view bug cannot recur.
     """
 
-    def __init__(self, num_layers: int, heads_per_layer: int, height: int, width: int):
+    def __init__(
+        self,
+        num_layers: int,
+        heads_per_layer: int,
+        height: int,
+        width: int,
+        d_model: int = 32,
+        n_attn_heads: int = 2,
+        d_ffn: int | None = None,
+        delta_rank: int = 1,
+        max_layers: int = 128,
+    ):
         super().__init__()
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
@@ -82,19 +261,33 @@ class DynamicStateMixer(nn.Module):
             raise ValueError(f"heads_per_layer must be >= 1, got {heads_per_layer}")
         if height < 1 or width < 1:
             raise ValueError(f"height/width must be >= 1, got {(height, width)}")
+        if num_layers > max_layers:
+            raise ValueError(
+                f"num_layers={num_layers} exceeds max_layers={max_layers}; "
+                "raise the constructor arg."
+            )
+
         self.num_layers = num_layers
         self.heads_per_layer = heads_per_layer
         self.height = height
         self.width = width
         self.num_groups = num_layers * heads_per_layer
-        self.layer_blocks = nn.ModuleList(
-            [_LayerMixerBlock(heads_per_layer, height, width) for _ in range(num_layers)]
+
+        self.layer_emb = nn.Embedding(max_layers, d_model)
+        self.block = MatrixMergerBlock(
+            heads_per_layer=heads_per_layer,
+            height=height,
+            width=width,
+            d_model=d_model,
+            n_attn_heads=n_attn_heads,
+            d_ffn=d_ffn,
+            delta_rank=delta_rank,
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> dict:
         if x.dim() != 4:
             raise ValueError(f"Expected 4D [B, 2*N, H, W], got {tuple(x.shape)}")
-        n_total = self.num_layers * self.heads_per_layer
+        n_total = self.num_groups
         if x.size(1) != 2 * n_total:
             raise ValueError(f"Expected channel size 2*N={2 * n_total}, got {x.size(1)}")
         if x.size(2) != self.height or x.size(3) != self.width:
@@ -102,40 +295,27 @@ class DynamicStateMixer(nn.Module):
                 f"Expected spatial size {(self.height, self.width)}, got {(x.size(2), x.size(3))}"
             )
 
-        bsz, _, h, w = x.shape
-        xa = x[:, :n_total].view(bsz, self.num_layers, self.heads_per_layer, h, w)
-        xb = x[:, n_total:].view(bsz, self.num_layers, self.heads_per_layer, h, w)
-        prev_ab = torch.zeros(bsz, self.heads_per_layer, h, w, device=x.device, dtype=x.dtype)
+        bsz = x.size(0)
+        h, w = self.height, self.width
 
-        logits_list: List[torch.Tensor] = []
-        coeff_list: List[torch.Tensor] = []
-        weight_a_list: List[torch.Tensor] = []
-        weight_b_list: List[torch.Tensor] = []
+        # Layer-major split.
+        a_all = x[:, :n_total].view(bsz, self.num_layers, self.heads_per_layer, h, w)
+        b_all = x[:, n_total:].view(bsz, self.num_layers, self.heads_per_layer, h, w)
+
         mixed_layers: List[torch.Tensor] = []
-
+        mask_means: List[torch.Tensor] = []
         for ell in range(self.num_layers):
-            xa_l = xa[:, ell]
-            xb_l = xb[:, ell]
-            cat = torch.cat([xa_l, xb_l, prev_ab], dim=1)
-            out = self.layer_blocks[ell](cat)
-            prev_ab = out["mixed"]
-            logits_list.append(out["logits"])
-            coeff_list.append(out["coeff"])
-            weight_a_list.append(out["weight_a"])
-            weight_b_list.append(out["weight_b"])
-            mixed_layers.append(prev_ab.unsqueeze(1))
+            a_l = a_all[:, ell]
+            b_l = b_all[:, ell]
+            le = self.layer_emb(torch.tensor(ell, device=x.device))
+            out = self.block(a_l, b_l, layer_emb=le)
+            mixed_layers.append(out["mixed"])
+            mask_means.append(out["mask"].mean())
 
-        mixed = torch.cat(mixed_layers, dim=1).view(bsz, n_total, h, w)
-        logits = torch.stack(logits_list, dim=1)
-        coeff = torch.stack(coeff_list, dim=1)
-        weight_a = torch.stack(weight_a_list, dim=1)
-        weight_b = torch.stack(weight_b_list, dim=1)
+        mixed = torch.stack(mixed_layers, dim=1).view(bsz, n_total, h, w)
         return {
-            "logits": logits,
-            "coeff": coeff,
-            "weight_a": weight_a,
-            "weight_b": weight_b,
             "mixed": mixed,
+            "mask_mean": torch.stack(mask_means).mean(),
         }
 
 

@@ -20,13 +20,23 @@ MODEL_KINDS = ("tiny_rwkv", "conv")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train state merger (tiny RWKV or conv).")
+    parser = argparse.ArgumentParser(
+        description="Train state merger. Two architectures supported: "
+        "`tiny_rwkv` (recurrent across layers) and `conv` (matrix-aware per-layer "
+        "merger with cross-head attention; the old broken Conv2d design has been "
+        "replaced — `conv` is kept as the CLI name for backwards compat)."
+    )
     parser.add_argument(
         "--model",
         type=str,
         default="tiny_rwkv",
         choices=MODEL_KINDS,
-        help="Merger architecture: 'tiny_rwkv' (default) or legacy 'conv'.",
+        help=(
+            "Merger architecture. 'tiny_rwkv' (default): recurrent walk over "
+            "layers with shared RWKV-4 cell. 'conv' (now matrix-aware, despite "
+            "the name): per-layer non-recurrent shared block with cross-head "
+            "self-attention and a low-rank residual delta."
+        ),
     )
     parser.add_argument("--dataset-dir", type=str, default="./data")
     parser.add_argument("--train-split", type=str, default="train")
@@ -43,15 +53,31 @@ def parse_args():
     parser.add_argument("--cosine-weight", type=float, default=0.2)
     parser.add_argument("--rec-tol", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    # Tiny RWKV hyperparameters (only used when --model=tiny_rwkv).
+    # Shared model hyperparameters (used by both architectures).
     parser.add_argument("--d-model", type=int, default=32)
     parser.add_argument("--d-ffn", type=int, default=64)
     parser.add_argument("--max-layers", type=int, default=128)
+    # tiny_rwkv-only.
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument(
         "--no-low-rank-mask",
         action="store_true",
-        help="Disable low-rank per-element mask (use only per-head scalar gate).",
+        help="(tiny_rwkv) Disable low-rank per-element mask (use only per-head scalar gate).",
+    )
+    # matrix mixer (conv kind) only.
+    parser.add_argument(
+        "--n-attn-heads",
+        type=int,
+        default=2,
+        help="(conv/matrix) Number of attention heads in the cross-head MHA block. "
+        "Must divide --d-model.",
+    )
+    parser.add_argument(
+        "--delta-rank",
+        type=int,
+        default=1,
+        help="(conv/matrix) Rank of the residual delta low-rank decomposition. "
+        "1 = scalar+row+col only, K>1 = sum of K outer products.",
     )
     return parser.parse_args()
 
@@ -59,7 +85,17 @@ def parse_args():
 def build_merger(args, num_layers: int, heads: int, h: int, w: int) -> torch.nn.Module:
     """Construct the merger model requested by `--model`."""
     if args.model == "conv":
-        return DynamicStateMixer(num_layers, heads, h, w)
+        return DynamicStateMixer(
+            num_layers,
+            heads,
+            h,
+            w,
+            d_model=args.d_model,
+            n_attn_heads=args.n_attn_heads,
+            d_ffn=args.d_ffn,
+            delta_rank=args.delta_rank,
+            max_layers=max(args.max_layers, num_layers),
+        )
     if args.model == "tiny_rwkv":
         config = TinyRWKVMergerConfig(
             d_model=args.d_model,

@@ -327,10 +327,19 @@ def evaluate_mixer_merge_2(
 
 def _build_headwise_for_kind(model_kind: str, ckpt_args: dict | None) -> HeadwiseStateMixer:
     """Return an unbuilt HeadwiseStateMixer wired to the right inner mixer class."""
+    ckpt_args = ckpt_args or {}
     if model_kind == "conv":
-        return HeadwiseStateMixer(mixer_cls=DynamicStateMixer)
+        return HeadwiseStateMixer(
+            mixer_cls=DynamicStateMixer,
+            mixer_kwargs={
+                "d_model": int(ckpt_args.get("d_model", 32)),
+                "d_ffn": int(ckpt_args.get("d_ffn", 64)),
+                "n_attn_heads": int(ckpt_args.get("n_attn_heads", 2)),
+                "delta_rank": int(ckpt_args.get("delta_rank", 1)),
+                "max_layers": int(ckpt_args.get("max_layers", 128)),
+            },
+        )
     if model_kind == "tiny_rwkv":
-        ckpt_args = ckpt_args or {}
         config = TinyRWKVMergerConfig(
             d_model=int(ckpt_args.get("d_model", 32)),
             d_ffn=int(ckpt_args.get("d_ffn", 64)),
